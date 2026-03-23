@@ -1,0 +1,1 @@
+请使用cmake和vcpkg安装适当的库并完成构建的CMakeFileLists.txt等程序测试完成并完成README.md之后才能完成任务，题目如下，vcpkg和cmake都是已经安装在系统上的不需要再进行安装，直接完成任务即可，使用C/C++完成：

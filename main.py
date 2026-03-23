@@ -1,0 +1,810 @@
+import os
+import toml
+import json
+import re
+import requests
+import time
+from typing import List, Dict, Any, Tuple
+from openai import OpenAI, APIConnectionError, InternalServerError
+from docxtpl import DocxTemplate
+from pypdf import PdfReader
+
+
+class HomeworkAutomator:
+    def __init__(self, config_path: str = "config.toml"):
+        self.config = self._load_config(config_path)
+        self._setup_clients()
+
+    def _load_config(self, path: str) -> Dict[str, Any]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"未找到配置文件: {path}. 请从模板config-template.toml创建"
+            )
+        return toml.load(path)
+
+    def _setup_clients(self):
+        # Setup Simple Model Client
+        simple_cfg = self.config["llm"]["simple"]
+        self.simple_client = OpenAI(
+            api_key=simple_cfg["api_key"], base_url=simple_cfg["base_url"]
+        )
+        self.simple_model = simple_cfg["model"]
+
+        # Setup Complex Model Client
+        complex_cfg = self.config["llm"]["complex"]
+        self.complex_client = OpenAI(
+            api_key=complex_cfg["api_key"], base_url=complex_cfg["base_url"]
+        )
+        self.complex_model = complex_cfg["model"]
+
+        # Setup Tools
+        self.searxng_base = self.config.get("searxng", {}).get(
+            "base_url", "http://localhost:8089/"
+        )
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "python_interpreter",
+                    "description": "执行 Python 代码。用于数学计算、子网划分等逻辑运算，只有涉及验证计算才能使用，无法请求网络。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": "要运行的 Python 代码。使用 print() 输出结果。",
+                            }
+                        },
+                        "required": ["code"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_web",
+                    "description": "通过 SearxNG 搜索互联网获取最新的计算机网络协议知识或相关资料。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "搜索关键词，用空格分割",
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+        ]
+
+    def _execute_python(self, code: str) -> str:
+        """执行 Python 代码并返回输出和返回值，限制文件和网络访问"""
+        import sys
+        from io import StringIO
+        import math, re, json, base64, datetime, itertools
+
+        # 安全预检查
+        forbidden_keywords = [
+            "open(",
+            "write(",
+            "read(",
+            "socket",
+            "requests",
+            "urllib",
+            "os.",
+            "shutil",
+            "pathlib",
+            "subprocess",
+            "sys.",
+            "eval(",
+            "exec(",
+        ]
+        for kw in forbidden_keywords:
+            if kw in code:
+                return f"Error: 权限受限，禁止使用 '{kw}'。"
+
+        old_stdout = sys.stdout
+        redirected_output = StringIO()
+        sys.stdout = redirected_output
+        try:
+            # 提供基础环境
+            safe_globals = {
+                "math": math,
+                "re": re,
+                "json": json,
+                "base64": base64,
+                "datetime": datetime,
+                "itertools": itertools,
+                "print": print,
+                "range": range,
+                "len": len,
+                "int": int,
+                "str": str,
+                "float": float,
+                "list": list,
+                "dict": dict,
+                "set": set,
+                "tuple": tuple,
+                "sum": sum,
+                "min": min,
+                "max": max,
+                "abs": abs,
+                "pow": pow,
+                "round": round,
+                "enumerate": enumerate,
+                "zip": zip,
+                "sorted": sorted,
+                "reversed": reversed,
+            }
+            loc = {}
+            exec(code, safe_globals, loc)
+            stdout_val = redirected_output.getvalue()
+            result_summary = f"Stdout:\n{stdout_val}\n"
+            if loc:
+                # 过滤掉全局变量，只保留执行中产生的局部变量
+                vars_summary = {
+                    k: str(v)
+                    for k, v in loc.items()
+                    if k not in safe_globals and not k.startswith("__")
+                }
+                if vars_summary:
+                    result_summary += (
+                        f"Variables:\n{json.dumps(vars_summary, ensure_ascii=False)}"
+                    )
+            return result_summary
+        except Exception as e:
+            return f"Stdout:\n{redirected_output.getvalue()}\nError: {e}"
+        finally:
+            sys.stdout = old_stdout
+
+    def _search_searxng(self, query: str) -> str:
+        """通过 SearxNG 搜索信息并返回前5条结果"""
+        try:
+            url = f"{self.searxng_base}search?q={query}&format=json"
+            response = requests.get(url, timeout=3600)
+            data = response.json()
+            results = data.get("results", [])[:5]  # 返回 5 条
+            if not results:
+                return "未找到结果"
+            summary = "\n".join(
+                [f"- {r.get('title')}: {r.get('content')}" for r in results]
+            )
+            return summary
+        except Exception as e:
+            return f"搜索失败: {e}"
+
+    def _handle_tool_calls(self, tool_calls: Any) -> List[Dict[str, str]]:
+        """执行工具调用并返回结果列表"""
+        results = []
+        for tool_call in tool_calls:
+            func_name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments)
+            except:
+                args = {}
+            print(f"  [执行工具] {func_name}: {args}")
+
+            if func_name == "python_interpreter":
+                result = self._execute_python(args.get("code", ""))
+            elif func_name == "search_web":
+                result = self._search_searxng(args.get("query", ""))
+            else:
+                result = "未知工具"
+
+            results.append(
+                {
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": func_name,
+                    "content": result,
+                }
+            )
+            print(f"  [工具结果] {result[:100]}...")
+        return results
+
+    def _call_ai(
+        self,
+        client: OpenAI,
+        model: str,
+        messages: List[Dict[str, Any]],
+        use_tools: bool = True,
+        **kwargs,
+    ) -> Any:
+        """封装 AI 调用，支持工具自动处理及网络错误重试"""
+        current_messages = messages.copy()
+
+        for _ in range(10):  # 最多 10 轮工具交互
+            call_params = {
+                "model": model,
+                "messages": current_messages,
+            }
+            if use_tools:
+                call_params["tools"] = self.tools
+
+            call_params.update(kwargs)
+
+            # 网络重试逻辑
+            max_retries = 10
+            last_err = None
+            response = None
+            for retry in range(max_retries + 1):
+                try:
+                    response = client.chat.completions.create(**call_params)
+                    break
+                except (
+                    APIConnectionError,
+                    InternalServerError,
+                    requests.exceptions.RequestException,
+                ) as e:
+                    last_err = e
+                    if retry < max_retries:
+                        wait_time = (retry + 1) * 2
+                        print(
+                            f"  [网络错误] {e}，正在进行第 {retry + 1} 次重试 ({wait_time}s)..."
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        print(f"  [严重错误] 已达最大重试次数，调用失败。")
+                        raise last_err
+
+            if not response:
+                return None
+            msg = response.choices[0].message
+
+            if msg.tool_calls:
+                current_messages.append(msg)
+                tool_results = self._handle_tool_calls(msg.tool_calls)
+                current_messages.extend(tool_results)
+            else:
+                return response
+        return response
+
+    def parse_pdf(self, pdf_path: str) -> Tuple[str, Dict[str, Any]]:
+        """解析PDF并利用LLM提取四个部分的内容"""
+        print(">>> 正在提取 PDF 文本...")
+        reader = PdfReader(pdf_path)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() + "\n"
+
+        print(">>> 正在使用 AI 解析作业结构...")
+        prompt = f"""你是一个作业解析助手。请阅读以下从 PDF 中提取的乱序或复杂的文本，并将其整理为结构化的 JSON 格式。
+要求：
+1. 提取“作业名称”（通常是标题）。
+2. 将内容分为四个部分：
+   - "homework_name": 作业名称字符串，不需要计算机网络等前缀，只需要直接写“第x课xxxx”。
+   - "choice": 包含完整题目的列表，列表格式，每个元素包含 "id" (题号) 和 "question" (完整题目及选项)。
+   - "short_answer": 包含完整题目的列表，列表格式，每个元素包含 "id" (题号) 和 "question" (完整题目)。
+   - "programming": 包含完整题目的列表，列表格式，每个元素包含 "id" (题号) 和 "question" (完整要求/链接提示)。
+3. 严格输出 JSON 格式，不要任何 Markdown。
+
+文本内容：
+{full_text}
+"""
+        response = self._call_ai(
+            self.simple_client,
+            self.simple_model,
+            [{"role": "user", "content": prompt}],
+            use_tools=False,
+            response_format={"type": "json_object"},
+        )
+
+        if not response or not hasattr(response, "choices"):
+            raise ValueError("AI 解析 PDF 结构失败")
+        content = response.choices[0].message.content
+        if content is None:
+            raise ValueError("AI 解析内容为空")
+
+        data = json.loads(content)
+        homework_name = data.get("homework_name", "未命名作业")
+        parts = {
+            "choice": data.get("choice", []),
+            "short_answer": data.get("short_answer", []),
+            "programming": data.get("programming", []),
+        }
+
+        # 让用户审阅解析出的题目
+        def print_preview():
+            print("\n" + "=" * 30)
+            print("AI 解析出的题目预览：")
+            print(f"作业名称: {homework_name}")
+            print("-" * 15)
+            print("解析出的单项选择题：")
+            for c in parts["choice"]:
+                print(f"[{c.get('id', '?')}] {c.get('question', '')}")
+            print("-" * 15)
+            print("解析出的简答题：")
+            for q in parts["short_answer"]:
+                print(f"[{q.get('id', '?')}] {q.get('question', '')}")
+            print("-" * 15)
+            print("解析出的编程题：")
+            for p in parts["programming"]:
+                print(f"[{p.get('id', '?')}] {p.get('question', '')}")
+            print("=" * 30)
+
+        print_preview()
+
+        while True:
+            confirm = input(
+                "\n解析出的题目是否正确？(输入 'OK' 继续, 或输入修改意见重新解析): "
+            ).strip()
+            if confirm.upper() == "OK":
+                break
+            else:
+                print(f">>> 正在根据意见重新解析: {confirm}")
+                retry_prompt = f"""之前的解析有误，用户意见："{confirm}"
+请根据意见重新整理 PDF 文本内容。
+要求输出完整的结构化 JSON。
+PDF 文本：{full_text[:2000]}...
+"""
+                response = self._call_ai(
+                    self.simple_client,
+                    self.simple_model,
+                    [{"role": "user", "content": retry_prompt}],
+                    use_tools=False,
+                    response_format={"type": "json_object"},
+                )
+                if not response or not hasattr(response, "choices"):
+                    continue
+                content = response.choices[0].message.content
+                if not content:
+                    continue
+                data = json.loads(content)
+
+                if isinstance(data, dict):
+                    homework_name = data.get("homework_name", homework_name)
+                    parts = {
+                        "choice": data.get("choice", parts["choice"]),
+                        "short_answer": data.get("short_answer", parts["short_answer"]),
+                        "programming": data.get("programming", parts["programming"]),
+                    }
+                print("\n>>> 重新解析完成，请再次审阅。")
+                print_preview()
+
+        return homework_name, parts
+
+    def solve_choice_questions(self, choices_list: List[Dict[str, Any]]) -> List[str]:
+        """使用复杂模型解决选择题 (CoT + 每题搜索 + 循环审阅)"""
+        if not choices_list:
+            return [""] * 20
+
+        student_name = self.config["student_info"]["name"]
+        final_ans = [""] * 20
+        pending_choices = choices_list.copy()
+
+        max_rounds = 10
+        for round_idx in range(max_rounds):
+            if not pending_choices:
+                break
+
+            print(
+                f"\n>>> 选择题处理第 {round_idx + 1} 轮 (剩余 {len(pending_choices)} 题)..."
+            )
+
+            # 为当前轮次的每道题进行搜索背景调查
+            current_batch_context = {}
+            for q in pending_choices:
+                qid = str(q.get("id"))
+                print(f"  [搜索中] 第 {qid} 题...")
+                search_res = self._search_searxng(f"计算机网络 {q.get('question')}")
+                current_batch_context[qid] = search_res
+
+            prompt = f"""你是一个计算机网络助教。请解决以下选择题。
+主题：计算机网络
+
+要求使用 Chain-of-Thought (CoT) 模式：
+1. 深入分析题目背景，并在 <thought> 标签内明确列出【考察知识点】。
+2. 参考提供的【参考背景信息】辅助推导。
+3. 展现分步骤推导逻辑。
+4. 最终答案（如 "A" 或 "AB"）写在 <answer> 标签内。
+5. 严格输出 JSON：
+{{
+  "results": [
+    {{
+      "id": 题号,
+      "analysis": "<thought>【考察知识点】：xxx\n【推导逻辑】：xxx</thought>",
+      "answer": "<answer>A</answer>"
+    }}, ...
+  ]
+}}
+
+【参考背景信息】：
+{json.dumps(current_batch_context, ensure_ascii=False)}
+
+题目内容：
+{json.dumps(pending_choices, ensure_ascii=False)}
+"""
+            response = self._call_ai(
+                self.complex_client,
+                self.complex_model,
+                [{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+
+            if not response or not hasattr(response, "choices"):
+                continue
+            content = response.choices[0].message.content
+            if not content:
+                continue
+            try:
+                data = json.loads(content)
+            except Exception as e:
+                print(f"  [错误] JSON 解析失败: {e}")
+                continue
+
+            # 防御性解析
+            results_data = []
+            if isinstance(data, list):
+                results_data = data
+            elif isinstance(data, dict):
+                results_data = data.get("results", [])
+                if not results_data and "ans" in data:
+                    results_data = data.get("ans", [])
+
+            results_map = {}
+            for r in results_data:
+                if isinstance(r, dict):
+                    qid = str(r.get("id"))
+                    results_map[qid] = r
+
+            still_pending = []
+            for q in pending_choices:
+                qid = str(q.get("id"))
+                res = results_map.get(qid)
+                if not res:
+                    still_pending.append(q)
+                    continue
+
+                thought_match = re.search(
+                    r"<thought>(.*?)</thought>", res.get("analysis", ""), re.S
+                )
+                ans_match = re.search(
+                    r"<answer>(.*?)</answer>", res.get("answer", ""), re.S
+                )
+                thought_str = thought_match.group(1).strip() if thought_match else ""
+                answer_str = ans_match.group(1).strip() if ans_match else ""
+
+                review_prompt = f"""作为审阅专家，请严谨核查此选择题。
+题目：{q.get('question')}
+思路：{thought_str}
+答案：{answer_str}
+【参考背景信息】：{current_batch_context.get(qid, "无")}
+
+核查要求（务必严谨）：
+1. 【事实核查是核心】：你的主要任务是判断推导思路是否符合计算机网络协议和逻辑事实。
+2. 【有目的的工具使用】：仅在需要验证具体数据、计算结果或协议细节时使用工具。禁止盲目搜索题目或执行无关代码。
+3. 【思路校验】：检查“考察知识点”是否准确，推导过程是否存在逻辑跳跃或错误。
+4. 【参考原题】：只有在确认网上存在高度匹配的原题时，才参考其标准答案。
+5. 【身份契合度】：确认文风符合大二学生 {student_name} 的真实水平，去 AI 化。
+
+输出要求：若思路正确且事实无误，输出中必须包含 "PASS"。否则，请指出具体的事实错误或逻辑漏洞。
+"""
+                rev_res = self._call_ai(
+                    self.simple_client,
+                    self.simple_model,
+                    [{"role": "user", "content": review_prompt}],
+                    use_tools=True,
+                )
+
+                if not rev_res or not hasattr(rev_res, "choices"):
+                    continue
+                rev_content = rev_res.choices[0].message.content
+                if rev_content and "PASS" in rev_content.strip().upper():
+                    # 兜底检查
+                    clean_ans = re.sub(r"[^A-Za-z ]", "", answer_str).upper().strip()
+                    if not clean_ans:
+                        print(f"  [题号 {qid}] 答案格式非法，进入下一轮重试")
+                        still_pending.append(q)
+                        continue
+
+                    print(f"  [题号 {qid}] 审阅通过: {clean_ans}")
+                    try:
+                        base_qid = qid.split("-")[0]
+                        idx = int(base_qid) - 1
+                        if 0 <= idx < 20:
+                            final_ans[idx] = clean_ans
+                    except:
+                        pass
+                else:
+                    reason = rev_content.strip() if rev_content else "未通过"
+                    print(f"  [题号 {qid}] 审阅未通过: {reason}")
+                    q_with_feedback = q.copy()
+                    q_with_feedback["feedback"] = reason  # 修复：不污染题目本身
+                    still_pending.append(q_with_feedback)
+
+            pending_choices = still_pending
+
+        return final_ans
+
+    def solve_short_answers(
+        self, short_answer_list: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """使用复杂模型解决简答题，并由简单模型审阅（CoT 循环反馈机制）"""
+        if not short_answer_list:
+            return []
+
+        student_name = self.config["student_info"]["name"]
+        pending_questions = short_answer_list.copy()
+        final_results_map = {}
+
+        max_rounds = 10
+        for round_idx in range(max_rounds):
+            if not pending_questions:
+                break
+
+            print(
+                f"\n>>> 简答题处理第 {round_idx + 1} 轮 (剩余 {len(pending_questions)} 题)..."
+            )
+            # 为当前轮次的每道题进行搜索背景调查
+            current_batch_context = {}
+            for q in pending_questions:
+                qid = str(q.get("id"))
+                print(f"  [搜索中] 第 {qid} 题...")
+                search_res = self._search_searxng(f"计算机网络 {q.get('question')}")
+                current_batch_context[qid] = search_res
+
+            solve_prompt = f"""你是一个大二学生 {student_name}。正在完成计算机网络作业。
+要求使用 CoT 模式进行推理：
+1. 在 <thought> 标签内首先明确列出该题目的【考察知识点】，结合【参考背景信息】和之前的【反馈意见】（如果有）进行逻辑推导。
+2. 将最终给出的纯文本回答写在 <answer> 标签内。
+3. 回答要求（严禁 Markdown，语气严谨）：
+   - 语气正式、专业且客观，采用严谨的【实验报告】风格。
+   - 严禁出现任何 Markdown 语法（如加粗 **、列表 -、代码块等）。
+   - 严禁出现大量括号解释，严禁中英文同时出现（除非是专有名词且非常有必要）。
+   - 逻辑推导严密，表述精炼，符合学术规范。
+   - 仅限中文，除了必要的英文专业术语。
+4. 严格输出为 JSON 格式：
+{{
+  "answers": [
+    {{
+      "id": "题号",
+      "analysis": "<thought>【考察知识点】：xxx\n【分析】：xxx</thought>",
+      "answer": "<answer>最终回答内容...</answer>"
+    }}, ...
+  ]
+}}
+
+【参考背景信息】：
+{json.dumps(current_batch_context, ensure_ascii=False)}
+
+待处理题目（包含题目和可能的反馈意见）：
+{json.dumps(pending_questions, ensure_ascii=False)}
+"""
+            response = self._call_ai(
+                self.complex_client,
+                self.complex_model,
+                [{"role": "user", "content": solve_prompt}],
+                response_format={"type": "json_object"},
+            )
+
+            if not response or not hasattr(response, "choices"):
+                continue
+            content = response.choices[0].message.content
+            if not content:
+                continue
+
+            try:
+                data = json.loads(content)
+            except Exception as e:
+                print(f"  [错误] JSON 解析失败: {e}")
+                continue
+
+            current_answers = {}
+            # 防御性解析
+            ans_data = []
+            if isinstance(data, list):
+                ans_data = data
+            elif isinstance(data, dict):
+                ans_data = data.get("answers", [])
+                if not ans_data and "results" in data:
+                    ans_data = data.get("results", [])
+
+            for a in ans_data:
+                if not isinstance(a, dict):
+                    continue
+                qid = str(a.get("id"))
+                raw_ans = a.get("answer", "")
+                ans_match = re.search(r"<answer>(.*?)</answer>", raw_ans, re.S)
+                current_answers[qid] = (
+                    ans_match.group(1).strip() if ans_match else raw_ans
+                )
+
+            # 2. 简单模型审阅
+            still_pending = []
+            for q in pending_questions:
+                qid = str(q.get("id"))
+                title = q.get("question", "")
+                ans = current_answers.get(qid, "（未生成回答）")
+
+                review_prompt = f"""你是一个计算机网络审阅专家。请严谨审阅以下简答题答案。
+题目：{title}
+回答：{ans}
+【参考背景信息】：{current_batch_context.get(qid, "暂无相关背景资料")}
+
+审阅标准（事实优先）：
+1. 【考点核查】：确认回答是否命中了该题目的计算机网络核心知识点。
+2. 【推导验证】：重点核查推导逻辑。由于题目是新出的，请利用工具核查其引用的原理、协议细节或计算公式是否准确。
+3. 【文风审查】：语气必须正式、专业、客观，符合严谨的实验报告规范。严禁括号解释、严禁非必要的中英并列。
+4. 【格式要求】：必须是纯文本，无 Markdown。
+
+要求：完全合格则输出中含有 "PASS"，否则不含有 "PASS" 并指出具体错误。
+"""
+                rev_res = self._call_ai(
+                    self.simple_client,
+                    self.simple_model,
+                    [{"role": "user", "content": review_prompt}],
+                    use_tools=True,
+                )
+
+                if not rev_res or not hasattr(rev_res, "choices"):
+                    continue
+                rev_content = rev_res.choices[0].message.content
+                if rev_content and "PASS" in rev_content.strip().upper():
+                    print(f"  [题号 {qid}] 审阅通过")
+                    final_results_map[qid] = {
+                        "index": q.get("id", ""),
+                        "title": title,
+                        "answer": ans,
+                    }
+                else:
+                    reason = rev_content.strip() if rev_content else "审阅未通过"
+                    print(f"  [题号 {qid}] 审阅未通过: {reason}")
+                    q_with_feedback = q.copy()
+                    q_with_feedback["feedback"] = reason  # 修复
+                    still_pending.append(q_with_feedback)
+
+            pending_questions = still_pending
+
+        # 整理结果
+        results = []
+        for q in short_answer_list:
+            qid = str(q.get("id"))
+            if qid in final_results_map:
+                results.append(final_results_map[qid])
+            else:
+                results.append(
+                    {
+                        "index": q.get("id", ""),
+                        "title": q.get("question", ""),
+                        "answer": "（未通过审阅）",
+                    }
+                )
+
+        return results
+
+    def handle_programming(self, prog_list: List[Dict[str, Any]]) -> str:
+        """处理程序设计题"""
+        if not prog_list:
+            return ""
+
+        with open("project_prompt.txt", "r", encoding="utf-8") as f:
+            system_prompt = f.read()
+
+        gitee_links = []
+        for p in prog_list:
+            print("\n" + "=" * 20)
+            print(f"处理程序设计题 [{p.get('id', '?')}]:")
+            print(p.get("question", ""))
+            print("=" * 20)
+            user_prompt = (
+                f"系统提示词: {system_prompt}\n当前题目: {p.get('question', '')}"
+            )
+            print(f"生成的提示词已准备好供参考: \n--BEGIN--\n{user_prompt}\n--END--")
+            gitee_link = input(
+                f"\n请输入第 {p.get('id', '?')} 题项目完成后的 Gitee 链接: "
+            ).strip()
+            if not gitee_link.startswith("http"):
+                gitee_link = "尚未提供有效链接"
+            gitee_links.append(f"{p.get('id', '?')}:{gitee_link}")
+
+        return "\n".join(gitee_links)
+
+    def _clean_markdown(self, text: str) -> str:
+        """强力去除文本中的 Markdown 语法，返回纯文本"""
+        if not text:
+            return ""
+        # 1. 去除代码块标识
+        text = re.sub(r"```.*?```", "", text, flags=re.S)
+        # 2. 去除加粗/斜体
+        text = re.sub(r"\*\*+(.*?)\*\*+", r"\1", text)
+        text = re.sub(r"\*+(.*?)\*+", r"\1", text)
+        text = re.sub(r"__+(.*?)__+", r"\1", text)
+        text = re.sub(r"_+(.*?)_+", r"\1", text)
+        # 3. 去除标题符号
+        text = re.sub(r"^#+\s+", "", text, flags=re.M)
+        # 4. 去除行内代码
+        text = re.sub(r"`(.*?)`", r"\1", text)
+        # 5. 去除链接
+        text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)
+        # 6. 去除列表符号 (仅去除行首的 * 或 - )
+        text = re.sub(r"^[\s\t]*[\*\-\+]\s+", "", text, flags=re.M)
+        # 7. 去除数字列表开头的点
+        text = re.sub(r"^[\s\t]*\d+\.\s+", "", text, flags=re.M)
+        return text.strip()
+
+    def generate_docx(self, homework_name: str, context: Dict[str, Any]):
+        """生成最终的 docx 文件，包含兜底清理"""
+        # 对 context 中的所有文本内容进行兜底清理
+        if "questions" in context:
+            for q in context["questions"]:
+                q["answer"] = self._clean_markdown(q["answer"])
+
+        tpl = DocxTemplate("template.docx")
+        tpl.render(context)
+        safe_name = re.sub(r'[\\/:*?"<>|]', "_", homework_name)
+        output_name = f"{safe_name}.docx"
+        tpl.save(output_name)
+        return output_name
+
+    def run(self, pdf_path: str):
+        print(f">>> 开始解析 PDF: {pdf_path}")
+        homework_name, parts = self.parse_pdf(pdf_path)
+        print(f">>> 作业名称: {homework_name}")
+
+        print(">>> 正在处理选择题...")
+        ans = self.solve_choice_questions(parts["choice"])
+
+        print(">>> 正在处理简答题...")
+        questions = self.solve_short_answers(parts["short_answer"])
+
+        print(">>> 正在处理程序设计题...")
+        gitee_info = self.handle_programming(parts["programming"])
+
+        context = {
+            "homework_name": homework_name,
+            "class_name": self.config["student_info"]["class"],
+            "student_id": self.config["student_info"]["id"],
+            "name": self.config["student_info"]["name"],
+            "ans": ans,
+            "questions": questions,
+            "gitee_info": gitee_info,
+        }
+
+        output_file = self.generate_docx(homework_name, context)
+        print(f"\n[成功] 作业已生成: {output_file}")
+
+        while True:
+            feedback = input(
+                "\n请输入反馈 (输入 'OK' 确认并退出, 或输入修改意见): "
+            ).strip()
+            if feedback.upper() == "OK":
+                print("作业已确认，程序退出。")
+                break
+            else:
+                print(f">>> 正在根据反馈修改作业: {feedback}")
+                adjustment_prompt = f"""用户对生成的作业提出了修改意见："{feedback}"
+请根据意见调整当前的作业内容。
+当前内容：{json.dumps(context, ensure_ascii=False)}
+要求：严格输出调整后的完整 JSON。
+"""
+                adj_res = self._call_ai(
+                    self.complex_client,
+                    self.complex_model,
+                    [{"role": "user", "content": adjustment_prompt}],
+                    response_format={"type": "json_object"},
+                )
+                if not adj_res or not hasattr(adj_res, "choices"):
+                    continue
+                adj_content = adj_res.choices[0].message.content
+                if adj_content:
+                    context = json.loads(adj_content)
+                    output_file = self.generate_docx(homework_name, context)
+                    print(f"\n[成功] 已根据反馈重新生成作业: {output_file}")
+
+
+if __name__ == "__main__":
+    import sys
+
+    pdf_files = [f for f in os.listdir(".") if f.endswith(".pdf")]
+    if not pdf_files:
+        print("未找到 PDF 文件。")
+        sys.exit(1)
+    target_pdf = pdf_files[0]
+    if len(sys.argv) > 1:
+        target_pdf = sys.argv[1]
+    try:
+        automator = HomeworkAutomator()
+        automator.run(target_pdf)
+    except Exception as e:
+        print(f"\n[错误] 运行失败: {e}")

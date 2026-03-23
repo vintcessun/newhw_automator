@@ -1,0 +1,17 @@
+[llm.simple]
+model = "YOUR_SIMPLE_MODEL_NAME"
+api_key = "YOUR_API_KEY"
+base_url = "https://api.example.com/v1"
+
+[llm.complex]
+model = "YOUR_COMPLEX_MODEL_NAME"
+api_key = "YOUR_API_KEY"
+base_url = "https://api.example.com/v1"
+
+[searxng]
+base_url = "http://searxng-example.com/"
+
+[student_info]
+name = "张三"
+id = "20220001"
+class = "计算机2201"

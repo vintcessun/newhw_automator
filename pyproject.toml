@@ -1,0 +1,15 @@
+[project]
+name = "newhw-automator"
+version = "0.1.0"
+description = "A auto homework generator using LLMs"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "docxtpl>=0.20.2",
+    "numpy>=2.4.3",
+    "openai>=2.29.0",
+    "pypdf>=6.9.1",
+    "python-docx>=1.2.0",
+    "scipy>=1.17.1",
+    "toml>=0.10.2",
+]
