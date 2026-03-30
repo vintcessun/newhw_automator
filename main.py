@@ -2,12 +2,15 @@ import os
 import toml
 import json
 import re
+import base64
 import requests
 import time
 from typing import List, Dict, Any, Tuple
 from openai import OpenAI, APIConnectionError, InternalServerError
 from docxtpl import DocxTemplate
 from pypdf import PdfReader
+import fitz
+import numpy as np
 
 
 class HomeworkAutomator:
@@ -225,7 +228,7 @@ class HomeworkAutomator:
             call_params.update(kwargs)
 
             # 网络重试逻辑
-            max_retries = 10
+            max_retries = 1000
             last_err = None
             response = None
             for retry in range(max_retries + 1):
@@ -260,7 +263,206 @@ class HomeworkAutomator:
                 return response
         return response
 
-    def parse_pdf(self, pdf_path: str) -> Tuple[str, Dict[str, Any]]:
+    def _build_image_message(
+        self, prompt: str, image_paths: List[str]
+    ) -> List[Dict[str, Any]]:
+        """构造带可选图片的 user 消息，图片不存在时自动降级为纯文本"""
+        valid_paths = [p for p in image_paths if p and os.path.exists(p)]
+        if not valid_paths:
+            return [{"role": "user", "content": prompt}]
+
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for p in valid_paths:
+            with open(p, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            content.append({"type": "text", "text": f"题目截图：{os.path.basename(p)}"})
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
+            )
+        return [{"role": "user", "content": content}]
+
+    def _extract_page_lines(self, page: fitz.Page) -> List[Dict[str, Any]]:
+        """提取页面文本行及其坐标，用于题目截图定位"""
+        page_dict = page.get_text("dict")
+        lines: List[Dict[str, Any]] = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                text = "".join(s.get("text", "") for s in spans).strip()
+                if not text:
+                    continue
+                x0 = min(s.get("bbox", [0, 0, 0, 0])[0] for s in spans)
+                y0 = min(s.get("bbox", [0, 0, 0, 0])[1] for s in spans)
+                x1 = max(s.get("bbox", [0, 0, 0, 0])[2] for s in spans)
+                y1 = max(s.get("bbox", [0, 0, 0, 0])[3] for s in spans)
+                lines.append({"text": text, "bbox": (x0, y0, x1, y1)})
+        lines.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+        return lines
+
+    def _merge_pixmaps(self, pixmaps: List[fitz.Pixmap]) -> fitz.Pixmap:
+        """垂直合并多个 Pixmap，使用 numpy 处理"""
+        if not pixmaps:
+            return None
+        if len(pixmaps) == 1:
+            return pixmaps[0]
+
+        arrays = []
+        for p in pixmaps:
+            # 将 pixmap 转换为 numpy 数组 (H, W, C)
+            img = np.frombuffer(p.samples, dtype=np.uint8).reshape(
+                p.height, p.width, p.n
+            )
+            arrays.append(img)
+
+        max_w = max(a.shape[1] for a in arrays)
+        padded_arrays = []
+        for a in arrays:
+            if a.shape[1] < max_w:
+                # 如果宽度不一致，右侧填充白色
+                pad = (
+                    np.ones(
+                        (a.shape[0], max_w - a.shape[1], a.shape[2]), dtype=np.uint8
+                    )
+                    * 255
+                )
+                a = np.hstack([a, pad])
+            padded_arrays.append(a)
+
+        merged_array = np.vstack(padded_arrays)
+        # 从 numpy 数组还原回 fitz.Pixmap
+        return fitz.Pixmap(
+            pixmaps[0].colorspace,
+            merged_array.shape[1],
+            merged_array.shape[0],
+            merged_array.tobytes(),
+            pixmaps[0].alpha,
+        )
+
+    def generate_problem_screenshots(
+        self, pdf_path: str, parts: Dict[str, Any]
+    ) -> Dict[str, Dict[str, str]]:
+        """按题号从 PDF 裁剪题目截图，保存到 problems 目录 (支持跨页)"""
+        out_dir = "problems"
+        os.makedirs(out_dir, exist_ok=True)
+
+        choice_ids = [str(q.get("id", "")).strip() for q in parts.get("choice", [])]
+        short_ids = [
+            str(q.get("id", "")).strip() for q in parts.get("short_answer", [])
+        ]
+        prog_ids = [str(q.get("id", "")).strip() for q in parts.get("programming", [])]
+
+        all_ids = [qid for qid in (choice_ids + short_ids + prog_ids) if qid]
+        id_set = set(all_ids)
+        if not id_set:
+            return {"choice": {}, "short_answer": {}, "programming": {}}
+
+        doc = fitz.open(pdf_path)
+        starts: List[Dict[str, Any]] = []
+        seen = set()
+
+        # 根据“数字+分隔符”定位题目起始行
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            for line in self._extract_page_lines(page):
+                m = re.match(r"^\s*(\d{1,3})\s*[\.、．\)]\s*", line["text"])
+                if not m:
+                    continue
+                qid = m.group(1)
+                if qid in id_set and qid not in seen:
+                    starts.append(
+                        {
+                            "id": qid,
+                            "page": page_idx,
+                            "y": line["bbox"][1],
+                        }
+                    )
+                    seen.add(qid)
+
+        starts.sort(key=lambda item: (item["page"], item["y"]))
+
+        def _get_clip_pixmap(page: fitz.Page, y0: float, y1: float) -> fitz.Pixmap:
+            """截取指定高度范围的页面 Pixmap，并尝试去除页眉页脚空白"""
+            lines = self._extract_page_lines(page)
+            # 过滤属于该区域的行，跳过明显是页眉（顶部 50 单位）或页脚（底部 50 单位）的内容（如果它们跨页了）
+            relevant_lines = []
+            for ln in lines:
+                ly0, ly1 = ln["bbox"][1], ln["bbox"][3]
+                # 如果是中间页，忽略顶部和底部的页眉页脚（大致估算 55 单位）
+                is_header = ly1 < 60
+                is_footer = ly0 > page.rect.height - 60
+
+                if ly0 >= y0 - 4 and ly1 <= y1 + 4:
+                    # 只有当这不是唯一的行时，才跳过页眉页脚（防止题目本身就在页眉位置，虽然罕见）
+                    if not (is_header or is_footer):
+                        relevant_lines.append(ln)
+
+            if relevant_lines:
+                # 进一步缩紧边界
+                real_y0 = max(y0, min(ln["bbox"][1] for ln in relevant_lines) - 8)
+                real_y1 = min(y1, max(ln["bbox"][3] for ln in relevant_lines) + 8)
+            else:
+                real_y0, real_y1 = y0, y1
+
+            if real_y1 <= real_y0:
+                # 如果没有有效内容，返回一个极小的空白区域以防崩溃，或返回 None
+                return None
+
+            clip = fitz.Rect(0, real_y0, page.rect.width, real_y1)
+            return page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip, alpha=False)
+
+        pdf_prefix = os.path.splitext(os.path.basename(pdf_path))[0]
+        id_to_path: Dict[str, str] = {}
+        for idx, s in enumerate(starts):
+            start_page = s["page"]
+            start_y = s["y"]
+
+            if idx + 1 < len(starts):
+                end_page = starts[idx + 1]["page"]
+                end_y = starts[idx + 1]["y"]
+            else:
+                # 最后一题，到 PDF 末尾
+                end_page = len(doc) - 1
+                end_y = doc[end_page].rect.height
+
+            # 收集所有跨页片段
+            segments = []
+            for p_idx in range(start_page, end_page + 1):
+                page = doc[p_idx]
+                # 如果是第一页，从题目开始算；否则从页顶算
+                y0 = start_y if p_idx == start_page else 0
+                # 如果是最后一页，到下一题开始算；否则到页底算
+                y1 = end_y if p_idx == end_page else page.rect.height
+
+                if y1 > y0 + 2:  # 忽略过小的片段
+                    pix = _get_clip_pixmap(page, y0, y1)
+                    if pix:
+                        segments.append(pix)
+
+            if segments:
+                out_name = f"{pdf_prefix}_{s['id']}.png"
+                out_path = os.path.join(out_dir, out_name)
+                final_pix = self._merge_pixmaps(segments)
+                final_pix.save(out_path)
+                id_to_path[s["id"]] = out_path
+
+        doc.close()
+
+        return {
+            "choice": {qid: id_to_path.get(qid, "") for qid in choice_ids},
+            "short_answer": {qid: id_to_path.get(qid, "") for qid in short_ids},
+            "programming": {qid: id_to_path.get(qid, "") for qid in prog_ids},
+        }
+
+    def parse_pdf(
+        self, pdf_path: str
+    ) -> Tuple[str, Dict[str, Any], Dict[str, Dict[str, str]]]:
         """解析PDF并利用LLM提取四个部分的内容"""
         print(">>> 正在提取 PDF 文本...")
         reader = PdfReader(pdf_path)
@@ -304,67 +506,23 @@ class HomeworkAutomator:
             "programming": data.get("programming", []),
         }
 
-        # 让用户审阅解析出的题目
-        def print_preview():
-            print("\n" + "=" * 30)
-            print("AI 解析出的题目预览：")
-            print(f"作业名称: {homework_name}")
-            print("-" * 15)
-            print("解析出的单项选择题：")
-            for c in parts["choice"]:
-                print(f"[{c.get('id', '?')}] {c.get('question', '')}")
-            print("-" * 15)
-            print("解析出的简答题：")
-            for q in parts["short_answer"]:
-                print(f"[{q.get('id', '?')}] {q.get('question', '')}")
-            print("-" * 15)
-            print("解析出的编程题：")
-            for p in parts["programming"]:
-                print(f"[{p.get('id', '?')}] {p.get('question', '')}")
-            print("=" * 30)
+        print(">>> 正在生成题目截图到 problems 目录...")
+        screenshots = self.generate_problem_screenshots(pdf_path, parts)
 
-        print_preview()
+        print("\n" + "=" * 30)
+        print("AI 解析结果：")
+        print(f"作业名称: {homework_name}")
+        print(
+            f"选择题: {len(parts['choice'])} 道, 简答题: {len(parts['short_answer'])} 道, 编程题: {len(parts['programming'])} 道"
+        )
+        print("题目截图目录: problems")
+        print("=" * 30)
 
-        while True:
-            confirm = input(
-                "\n解析出的题目是否正确？(输入 'OK' 继续, 或输入修改意见重新解析): "
-            ).strip()
-            if confirm.upper() == "OK":
-                break
-            else:
-                print(f">>> 正在根据意见重新解析: {confirm}")
-                retry_prompt = f"""之前的解析有误，用户意见："{confirm}"
-请根据意见重新整理 PDF 文本内容。
-要求输出完整的结构化 JSON。
-PDF 文本：{full_text[:2000]}...
-"""
-                response = self._call_ai(
-                    self.simple_client,
-                    self.simple_model,
-                    [{"role": "user", "content": retry_prompt}],
-                    use_tools=False,
-                    response_format={"type": "json_object"},
-                )
-                if not response or not hasattr(response, "choices"):
-                    continue
-                content = response.choices[0].message.content
-                if not content:
-                    continue
-                data = json.loads(content)
+        return homework_name, parts, screenshots
 
-                if isinstance(data, dict):
-                    homework_name = data.get("homework_name", homework_name)
-                    parts = {
-                        "choice": data.get("choice", parts["choice"]),
-                        "short_answer": data.get("short_answer", parts["short_answer"]),
-                        "programming": data.get("programming", parts["programming"]),
-                    }
-                print("\n>>> 重新解析完成，请再次审阅。")
-                print_preview()
-
-        return homework_name, parts
-
-    def solve_choice_questions(self, choices_list: List[Dict[str, Any]]) -> List[str]:
+    def solve_choice_questions(
+        self, choices_list: List[Dict[str, Any]], image_map: Dict[str, str]
+    ) -> List[str]:
         """使用复杂模型解决选择题 (CoT + 每题搜索 + 循环审阅)"""
         if not choices_list:
             return [""] * 20
@@ -415,10 +573,15 @@ PDF 文本：{full_text[:2000]}...
 题目内容：
 {json.dumps(pending_choices, ensure_ascii=False)}
 """
+            solve_messages = self._build_image_message(
+                prompt,
+                [image_map.get(str(q.get("id")), "") for q in pending_choices],
+            )
+
             response = self._call_ai(
                 self.complex_client,
                 self.complex_model,
-                [{"role": "user", "content": prompt}],
+                solve_messages,
                 response_format={"type": "json_object"},
             )
 
@@ -480,10 +643,13 @@ PDF 文本：{full_text[:2000]}...
 
 输出要求：若思路正确且事实无误，输出中必须包含 "PASS"。否则，请指出具体的事实错误或逻辑漏洞。
 """
+                review_messages = self._build_image_message(
+                    review_prompt, [image_map.get(qid, "")]
+                )
                 rev_res = self._call_ai(
                     self.simple_client,
                     self.simple_model,
-                    [{"role": "user", "content": review_prompt}],
+                    review_messages,
                     use_tools=True,
                 )
 
@@ -518,7 +684,7 @@ PDF 文本：{full_text[:2000]}...
         return final_ans
 
     def solve_short_answers(
-        self, short_answer_list: List[Dict[str, Any]]
+        self, short_answer_list: List[Dict[str, Any]], image_map: Dict[str, str]
     ) -> List[Dict[str, Any]]:
         """使用复杂模型解决简答题，并由简单模型审阅（CoT 循环反馈机制）"""
         if not short_answer_list:
@@ -571,10 +737,14 @@ PDF 文本：{full_text[:2000]}...
 待处理题目（包含题目和可能的反馈意见）：
 {json.dumps(pending_questions, ensure_ascii=False)}
 """
+            solve_messages = self._build_image_message(
+                solve_prompt,
+                [image_map.get(str(q.get("id")), "") for q in pending_questions],
+            )
             response = self._call_ai(
                 self.complex_client,
                 self.complex_model,
-                [{"role": "user", "content": solve_prompt}],
+                solve_messages,
                 response_format={"type": "json_object"},
             )
 
@@ -630,10 +800,13 @@ PDF 文本：{full_text[:2000]}...
 
 要求：完全合格则输出中含有 "PASS"，否则不含有 "PASS" 并指出具体错误。
 """
+                review_messages = self._build_image_message(
+                    review_prompt, [image_map.get(qid, "")]
+                )
                 rev_res = self._call_ai(
                     self.simple_client,
                     self.simple_model,
-                    [{"role": "user", "content": review_prompt}],
+                    review_messages,
                     use_tools=True,
                 )
 
@@ -739,14 +912,18 @@ PDF 文本：{full_text[:2000]}...
 
     def run(self, pdf_path: str):
         print(f">>> 开始解析 PDF: {pdf_path}")
-        homework_name, parts = self.parse_pdf(pdf_path)
+        homework_name, parts, screenshots = self.parse_pdf(pdf_path)
         print(f">>> 作业名称: {homework_name}")
 
         print(">>> 正在处理选择题...")
-        ans = self.solve_choice_questions(parts["choice"])
+        ans = self.solve_choice_questions(
+            parts["choice"], screenshots.get("choice", {})
+        )
 
         print(">>> 正在处理简答题...")
-        questions = self.solve_short_answers(parts["short_answer"])
+        questions = self.solve_short_answers(
+            parts["short_answer"], screenshots.get("short_answer", {})
+        )
 
         print(">>> 正在处理程序设计题...")
         gitee_info = self.handle_programming(parts["programming"])

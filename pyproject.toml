@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "docxtpl>=0.20.2",
+    "pymupdf>=1.26.5",
     "numpy>=2.4.3",
     "openai>=2.29.0",
     "pypdf>=6.9.1",

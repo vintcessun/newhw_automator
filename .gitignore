@@ -10,3 +10,7 @@ wheels/
 .venv
 config.toml
 *.pdf
+
+problems/
+*.docx
+!template.docx
