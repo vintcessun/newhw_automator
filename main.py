@@ -2,6 +2,7 @@ import os
 import toml
 import json
 import re
+import base64
 import requests
 import time
 import argparse
@@ -11,6 +12,8 @@ from typing import List, Dict, Any, Tuple
 from openai import OpenAI, APIConnectionError, InternalServerError
 from docxtpl import DocxTemplate
 from pypdf import PdfReader
+import fitz
+import numpy as np
 
 
 class HomeworkAutomator:
@@ -228,7 +231,7 @@ class HomeworkAutomator:
             call_params.update(kwargs)
 
             # 网络重试逻辑
-            max_retries = 10
+            max_retries = 1000
             last_err = None
             response = None
             for retry in range(max_retries + 1):
@@ -355,6 +358,7 @@ class HomeworkAutomator:
         keyword: str = "",
         exclude_keyword: str = "",
     ) -> Tuple[str, Dict[str, Any]]:
+
         """解析PDF并利用LLM提取四个部分的内容"""
         print(">>> 正在提取 PDF 文本...")
         reader = PdfReader(pdf_path)
@@ -438,65 +442,19 @@ class HomeworkAutomator:
             "programming": data.get("programming", []),
         }
 
-        # 让用户审阅解析出的题目
-        def print_preview():
-            print("\n" + "=" * 30)
-            print("AI 解析出的题目预览：")
-            print(f"作业名称: {homework_name}")
-            print("-" * 15)
-            print("解析出的单项选择题：")
-            for c in parts["choice"]:
-                print(f"[{c.get('id', '?')}] {c.get('question', '')}")
-            print("-" * 15)
-            print("解析出的简答题：")
-            for q in parts["short_answer"]:
-                print(f"[{q.get('id', '?')}] {q.get('question', '')}")
-            print("-" * 15)
-            print("解析出的编程题：")
-            for p in parts["programming"]:
-                print(f"[{p.get('id', '?')}] {p.get('question', '')}")
-            print("=" * 30)
+        print(">>> 正在生成题目截图到 problems 目录...")
+        screenshots = self.generate_problem_screenshots(pdf_path, parts)
 
-        print_preview()
+        print("\n" + "=" * 30)
+        print("AI 解析结果：")
+        print(f"作业名称: {homework_name}")
+        print(
+            f"选择题: {len(parts['choice'])} 道, 简答题: {len(parts['short_answer'])} 道, 编程题: {len(parts['programming'])} 道"
+        )
+        print("题目截图目录: problems")
+        print("=" * 30)
 
-        while True:
-            confirm = input(
-                "\n解析出的题目是否正确？(输入 'OK' 继续, 或输入修改意见重新解析): "
-            ).strip()
-            if confirm.upper() == "OK":
-                break
-            else:
-                print(f">>> 正在根据意见重新解析: {confirm}")
-                retry_prompt = f"""之前的解析有误，用户意见："{confirm}"
-请根据意见重新整理 PDF 文本内容。
-要求输出完整的结构化 JSON。
-PDF 文本：{full_text[:2000]}...
-"""
-                response = self._call_ai(
-                    self.simple_client,
-                    self.simple_model,
-                    [{"role": "user", "content": retry_prompt}],
-                    use_tools=False,
-                    response_format={"type": "json_object"},
-                )
-                if not response or not hasattr(response, "choices"):
-                    continue
-                content = response.choices[0].message.content
-                if not content:
-                    continue
-                data = json.loads(content)
-
-                if isinstance(data, dict):
-                    homework_name = data.get("homework_name", homework_name)
-                    parts = {
-                        "choice": data.get("choice", parts["choice"]),
-                        "short_answer": data.get("short_answer", parts["short_answer"]),
-                        "programming": data.get("programming", parts["programming"]),
-                    }
-                print("\n>>> 重新解析完成，请再次审阅。")
-                print_preview()
-
-        return homework_name, parts
+        return homework_name, parts, screenshots
 
     def solve_choice_questions(
         self, choices_list: List[Dict[str, Any]], ppt_evidence: str = ""
@@ -554,10 +512,15 @@ PDF 文本：{full_text[:2000]}...
 题目内容：
 {json.dumps(pending_choices, ensure_ascii=False)}
 """
+            solve_messages = self._build_image_message(
+                prompt,
+                [image_map.get(str(q.get("id")), "") for q in pending_choices],
+            )
+
             response = self._call_ai(
                 self.complex_client,
                 self.complex_model,
-                [{"role": "user", "content": prompt}],
+                solve_messages,
                 response_format={"type": "json_object"},
             )
 
@@ -620,10 +583,13 @@ PDF 文本：{full_text[:2000]}...
 
 输出要求：若思路正确且事实无误，输出中必须包含 "PASS"。否则，请指出具体的事实错误或逻辑漏洞。
 """
+                review_messages = self._build_image_message(
+                    review_prompt, [image_map.get(qid, "")]
+                )
                 rev_res = self._call_ai(
                     self.simple_client,
                     self.simple_model,
-                    [{"role": "user", "content": review_prompt}],
+                    review_messages,
                     use_tools=True,
                 )
 
@@ -714,10 +680,14 @@ PDF 文本：{full_text[:2000]}...
 待处理题目（包含题目和可能的反馈意见）：
 {json.dumps(pending_questions, ensure_ascii=False)}
 """
+            solve_messages = self._build_image_message(
+                solve_prompt,
+                [image_map.get(str(q.get("id")), "") for q in pending_questions],
+            )
             response = self._call_ai(
                 self.complex_client,
                 self.complex_model,
-                [{"role": "user", "content": solve_prompt}],
+                solve_messages,
                 response_format={"type": "json_object"},
             )
 
@@ -774,10 +744,13 @@ PDF 文本：{full_text[:2000]}...
 
 要求：完全合格则输出中含有 "PASS"，否则不含有 "PASS" 并指出具体错误。
 """
+                review_messages = self._build_image_message(
+                    review_prompt, [image_map.get(qid, "")]
+                )
                 rev_res = self._call_ai(
                     self.simple_client,
                     self.simple_model,
-                    [{"role": "user", "content": review_prompt}],
+                    review_messages,
                     use_tools=True,
                 )
 
