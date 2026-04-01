@@ -56,6 +56,19 @@ uv sync
 uv run python main.py [作业文件名.pdf]
 ```
 
+可选参数（用于从合集 PDF 中筛选本节课内容）：
+
+```bash
+uv run python main.py [作业文件名.pdf] --pages 1-3,5 --keyword "第六课" --exclude-keyword "答案" --evidence 第6课.pdf 第6课补充.pptx --ppt-keyword "TCP"
+```
+
+- `--pages`：只提取指定页码（1 开始），支持区间与逗号组合，如 `1-3,5,8-10`。
+- `--keyword`：在 `--pages` 结果上再次筛选，仅保留包含关键词的页面文本。若未命中，将自动回退为仅按页码筛选结果继续执行。
+- `--exclude-keyword`：在 `--keyword` 之后执行排除筛选，删除包含该关键词的页面文本。若排除后为空，将自动回退为排除前结果。
+- `--evidence`：加载一个或多个课件文件作为额外证据源（支持 `.pdf` 和 `.pptx`，会注入选择题与简答题的推理和审阅提示词）。示例：`--evidence 第6课.pdf 第6课补充.pptx`。
+- `--ppt`：兼容旧参数，等价于 `--evidence`。
+- `--ppt-keyword`：仅保留课件中包含该关键词的页文本后再注入。若未命中，将提示并不注入课件证据。
+
 ### 3. 交互流程
 1. **自动截图**：启动后会先解析 PDF，并在 `problems/` 下生成每题截图。
 2. **监控自动答题**：AI 会逐题进行搜索、CoT 推理和内部审阅，并附带题目截图作为上下文。
