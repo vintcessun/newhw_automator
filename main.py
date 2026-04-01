@@ -5,7 +5,7 @@ import re
 import base64
 import requests
 import time
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, cast
 from openai import OpenAI, APIConnectionError, InternalServerError
 from docxtpl import DocxTemplate
 from pypdf import PdfReader
@@ -14,6 +14,8 @@ import numpy as np
 
 
 class HomeworkAutomator:
+    CHOICE_QUESTION_LIMIT = 30
+
     def __init__(self, config_path: str = "config.toml"):
         self.config = self._load_config(config_path)
         self._setup_clients()
@@ -212,7 +214,7 @@ class HomeworkAutomator:
         model: str,
         messages: List[Dict[str, Any]],
         use_tools: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> Any:
         """封装 AI 调用，支持工具自动处理及网络错误重试"""
         current_messages = messages.copy()
@@ -264,18 +266,29 @@ class HomeworkAutomator:
         return response
 
     def _build_image_message(
-        self, prompt: str, image_paths: List[str]
+        self, prompt: str, image_inputs: List[Any]
     ) -> List[Dict[str, Any]]:
-        """构造带可选图片的 user 消息，图片不存在时自动降级为纯文本"""
-        valid_paths = [p for p in image_paths if p and os.path.exists(p)]
-        if not valid_paths:
+        """构造带可选图片的 user 消息，支持字符串路径或(标签, 路径)元组"""
+        normalized_inputs: List[Tuple[str, str]] = []
+        for item in image_inputs:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                label = str(item[0]).strip() or "截图"
+                path = str(item[1]).strip()
+            else:
+                path = str(item).strip()
+                label = f"题目截图：{os.path.basename(path)}"
+
+            if path and os.path.exists(path):
+                normalized_inputs.append((label, path))
+
+        if not normalized_inputs:
             return [{"role": "user", "content": prompt}]
 
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for p in valid_paths:
+        for label, p in normalized_inputs:
             with open(p, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("utf-8")
-            content.append({"type": "text", "text": f"题目截图：{os.path.basename(p)}"})
+            content.append({"type": "text", "text": label})
             content.append(
                 {
                     "type": "image_url",
@@ -283,6 +296,22 @@ class HomeworkAutomator:
                 }
             )
         return [{"role": "user", "content": content}]
+
+    def _collect_question_image_inputs(
+        self,
+        questions: List[Dict[str, Any]],
+        question_image_map: Dict[str, str],
+    ) -> List[Tuple[str, str]]:
+        """按题号收集题目截图，供多模态提示词使用"""
+        images: List[Tuple[str, str]] = []
+        for q in questions:
+            qid = str(q.get("id", "")).strip()
+            if not qid:
+                continue
+            q_img = question_image_map.get(qid, "")
+            if q_img:
+                images.append((f"第 {qid} 题题目截图", q_img))
+        return images
 
     def _extract_page_lines(self, page: fitz.Page) -> List[Dict[str, Any]]:
         """提取页面文本行及其坐标，用于题目截图定位"""
@@ -498,7 +527,7 @@ class HomeworkAutomator:
         if content is None:
             raise ValueError("AI 解析内容为空")
 
-        data = json.loads(content)
+        data = self._parse_json_safe(content)
         homework_name = data.get("homework_name", "未命名作业")
         parts = {
             "choice": data.get("choice", []),
@@ -521,14 +550,16 @@ class HomeworkAutomator:
         return homework_name, parts, screenshots
 
     def solve_choice_questions(
-        self, choices_list: List[Dict[str, Any]], image_map: Dict[str, str]
+        self,
+        choices_list: List[Dict[str, Any]],
+        image_map: Dict[str, str],
     ) -> List[str]:
         """使用复杂模型解决选择题 (CoT + 每题搜索 + 循环审阅)"""
         if not choices_list:
-            return [""] * 20
+            return [""] * self.CHOICE_QUESTION_LIMIT
 
         student_name = self.config["student_info"]["name"]
-        final_ans = [""] * 20
+        final_ans = [""] * self.CHOICE_QUESTION_LIMIT
         pending_choices = choices_list.copy()
 
         max_rounds = 10
@@ -555,15 +586,25 @@ class HomeworkAutomator:
 1. 深入分析题目背景，并在 <thought> 标签内明确列出【考察知识点】。
 2. 参考提供的【参考背景信息】辅助推导。
 3. 展现分步骤推导逻辑。
-4. 最终答案（如 "A" 或 "AB"）写在 <answer> 标签内。
-5. 严格输出 JSON：
+4. 最终答案必须写在 <answer> 标签内，且只能包含大写字母选项（如 A、AB、ACD），不得包含中文、标点、括号、前缀文本（如“答案：”）。
+
+输出格式硬约束（必须全部满足）：
+1. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
+2. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出任何解释文字。
+3. JSON 顶层键必须是 "results"，且为数组。
+4. 每个元素必须包含：
+   - "id": 与输入题号一致
+   - "analysis": "<thought>...推导...</thought>"
+   - "answer": "<answer>AB</answer>"（AB 仅为示例，必须为合法选项字母组合）
+
+示例：
 {{
   "results": [
     {{
-      "id": 题号,
-      "analysis": "<thought>【考察知识点】：xxx\n【推导逻辑】：xxx</thought>",
+      "id": "1",
+      "analysis": "<thought>【考察知识点】：...\n【推导逻辑】：...</thought>",
       "answer": "<answer>A</answer>"
-    }}, ...
+    }}
   ]
 }}
 
@@ -575,7 +616,7 @@ class HomeworkAutomator:
 """
             solve_messages = self._build_image_message(
                 prompt,
-                [image_map.get(str(q.get("id")), "") for q in pending_choices],
+                self._collect_question_image_inputs(pending_choices, image_map),
             )
 
             response = self._call_ai(
@@ -591,7 +632,7 @@ class HomeworkAutomator:
             if not content:
                 continue
             try:
-                data = json.loads(content)
+                data = self._parse_json_safe(content)
             except Exception as e:
                 print(f"  [错误] JSON 解析失败: {e}")
                 continue
@@ -622,11 +663,12 @@ class HomeworkAutomator:
                 thought_match = re.search(
                     r"<thought>(.*?)</thought>", res.get("analysis", ""), re.S
                 )
-                ans_match = re.search(
-                    r"<answer>(.*?)</answer>", res.get("answer", ""), re.S
-                )
+                raw_answer = str(res.get("answer", ""))
+                ans_match = re.search(r"<answer>(.*?)</answer>", raw_answer, re.S)
                 thought_str = thought_match.group(1).strip() if thought_match else ""
-                answer_str = ans_match.group(1).strip() if ans_match else ""
+                answer_str = (
+                    ans_match.group(1).strip() if ans_match else raw_answer.strip()
+                )
 
                 review_prompt = f"""作为审阅专家，请严谨核查此选择题。
 题目：{q.get('question')}
@@ -644,7 +686,8 @@ class HomeworkAutomator:
 输出要求：若思路正确且事实无误，输出中必须包含 "PASS"。否则，请指出具体的事实错误或逻辑漏洞。
 """
                 review_messages = self._build_image_message(
-                    review_prompt, [image_map.get(qid, "")]
+                    review_prompt,
+                    self._collect_question_image_inputs([q], image_map),
                 )
                 rev_res = self._call_ai(
                     self.simple_client,
@@ -668,7 +711,7 @@ class HomeworkAutomator:
                     try:
                         base_qid = qid.split("-")[0]
                         idx = int(base_qid) - 1
-                        if 0 <= idx < 20:
+                        if 0 <= idx < self.CHOICE_QUESTION_LIMIT:
                             final_ans[idx] = clean_ans
                     except:
                         pass
@@ -684,7 +727,9 @@ class HomeworkAutomator:
         return final_ans
 
     def solve_short_answers(
-        self, short_answer_list: List[Dict[str, Any]], image_map: Dict[str, str]
+        self,
+        short_answer_list: List[Dict[str, Any]],
+        image_map: Dict[str, str],
     ) -> List[Dict[str, Any]]:
         """使用复杂模型解决简答题，并由简单模型审阅（CoT 循环反馈机制）"""
         if not short_answer_list:
@@ -720,17 +765,26 @@ class HomeworkAutomator:
    - 严禁出现大量括号解释，严禁中英文同时出现（除非是专有名词且非常有必要）。
    - 逻辑推导严密，表述精炼，符合学术规范。
    - 仅限中文，除了必要的英文专业术语。
-4. 严格输出为 JSON 格式：
+
+输出格式硬约束（必须全部满足）：
+1. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
+2. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出任何解释文字。
+3. JSON 顶层键必须是 "answers"，且为数组。
+4. 每个元素必须包含：
+   - "id": 与输入题号一致
+   - "analysis": "<thought>...推导...</thought>"
+   - "answer": "<answer>最终回答内容</answer>"
+
+示例：
 {{
   "answers": [
     {{
-      "id": "题号",
-      "analysis": "<thought>【考察知识点】：xxx\n【分析】：xxx</thought>",
-      "answer": "<answer>最终回答内容...</answer>"
-    }}, ...
+      "id": "1",
+      "analysis": "<thought>【考察知识点】：...\n【分析】：...</thought>",
+      "answer": "<answer>...</answer>"
+    }}
   ]
 }}
-
 【参考背景信息】：
 {json.dumps(current_batch_context, ensure_ascii=False)}
 
@@ -739,7 +793,7 @@ class HomeworkAutomator:
 """
             solve_messages = self._build_image_message(
                 solve_prompt,
-                [image_map.get(str(q.get("id")), "") for q in pending_questions],
+                self._collect_question_image_inputs(pending_questions, image_map),
             )
             response = self._call_ai(
                 self.complex_client,
@@ -755,7 +809,7 @@ class HomeworkAutomator:
                 continue
 
             try:
-                data = json.loads(content)
+                data = self._parse_json_safe(content)
             except Exception as e:
                 print(f"  [错误] JSON 解析失败: {e}")
                 continue
@@ -801,7 +855,8 @@ class HomeworkAutomator:
 要求：完全合格则输出中含有 "PASS"，否则不含有 "PASS" 并指出具体错误。
 """
                 review_messages = self._build_image_message(
-                    review_prompt, [image_map.get(qid, "")]
+                    review_prompt,
+                    self._collect_question_image_inputs([q], image_map),
                 )
                 rev_res = self._call_ai(
                     self.simple_client,
@@ -905,30 +960,222 @@ class HomeworkAutomator:
 
         tpl = DocxTemplate("template.docx")
         tpl.render(context)
+        tpl_any = cast(Any, tpl)
         safe_name = re.sub(r'[\\/:*?"<>|]', "_", homework_name)
         output_name = f"{safe_name}.docx"
-        tpl.save(output_name)
-        return output_name
 
-    def run(self, pdf_path: str):
+        # 常见场景：目标 docx 正在被 Word 占用，先重试再降级到新文件名。
+        max_retries = 5
+        retry_interval_sec = 1.5
+        last_permission_err: Optional[PermissionError] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                tpl_any.save(output_name)
+                return output_name
+            except PermissionError as e:
+                last_permission_err = e
+                if attempt < max_retries:
+                    print(
+                        f">>> [警告] 保存失败（文件可能被占用）: {output_name}，{retry_interval_sec}s 后重试 "
+                        f"({attempt}/{max_retries})"
+                    )
+                    time.sleep(retry_interval_sec)
+
+        fallback_name = f"{safe_name}_{time.strftime('%Y%m%d_%H%M%S')}.docx"
+        try:
+            tpl_any.save(fallback_name)
+            print(f">>> [提示] 原文件仍被占用，已改为新文件名输出: {fallback_name}")
+            return fallback_name
+        except PermissionError:
+            if last_permission_err is not None:
+                raise last_permission_err
+            raise
+
+    def _parse_json_safe(self, content: str) -> Any:
+        """安全解析 JSON，自动处理代码块标记包裹的情况"""
+        if not content:
+            return None
+        # 尝试提取 ```json ... ``` 中间的内容
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.S)
+        if match:
+            content = match.group(1).strip()
+        return json.loads(content)
+
+    def _read_pdf_text(self, pdf_path: str) -> str:
+        """读取整份 PDF 文本，用于最终全量审阅对照"""
+        try:
+            reader = PdfReader(pdf_path)
+            chunks = []
+            for page in reader.pages:
+                chunks.append(page.extract_text() or "")
+            text = "\n".join(chunks).strip()
+            max_chars = 40000
+            if len(text) > max_chars:
+                return text[:max_chars]
+            return text
+        except Exception as e:
+            print(f">>> [警告] 读取参考 PDF 文本失败: {e}")
+            return ""
+
+    def _guard_context_update(
+        self,
+        original_context: Dict[str, Any],
+        candidate_context: Any,
+    ) -> Dict[str, Any]:
+        """对模型返回的作业 JSON 做兜底约束：只允许变更允许变更的字段。"""
+        if not isinstance(candidate_context, dict):
+            return original_context
+        candidate_dict = cast(Dict[str, Any], candidate_context)
+
+        guarded = dict(original_context)
+
+        # 第一部分元信息与第三部分 Git 地址禁止改动
+        for fixed_key in [
+            "homework_name",
+            "class_name",
+            "student_id",
+            "name",
+            "gitee_info",
+        ]:
+            guarded[fixed_key] = original_context.get(fixed_key, "")
+
+        # 第二部分-选择题：仅允许按原索引更新答案，长度与语义保持不变
+        original_ans = cast(List[Any], original_context.get("ans", []))
+        candidate_ans = cast(List[Any], candidate_dict.get("ans", []))
+        merged_ans = original_ans.copy()
+        for i in range(min(len(original_ans), len(candidate_ans))):
+            val = candidate_ans[i]
+            if not isinstance(val, str):
+                continue
+            clean_val = re.sub(r"[^A-Za-z ]", "", val).upper().strip()
+            if clean_val:
+                merged_ans[i] = clean_val
+        guarded["ans"] = merged_ans
+
+        # 第二部分-简答题：只允许修改 answer，index/title 强制保留原值
+        original_questions = cast(List[Any], original_context.get("questions", []))
+        candidate_questions = cast(List[Any], candidate_dict.get("questions", []))
+        merged_questions: List[Dict[str, Any]] = []
+        for i, oq in enumerate(original_questions):
+            if not isinstance(oq, dict):
+                continue
+            oq_dict = cast(Dict[str, Any], oq)
+
+            new_answer: str = str(oq_dict.get("answer", ""))
+            if i < len(candidate_questions) and isinstance(
+                candidate_questions[i], dict
+            ):
+                cand_q = cast(Dict[str, Any], candidate_questions[i])
+                cand_answer = cand_q.get("answer", new_answer)
+                if cand_answer is not None:
+                    new_answer = str(cand_answer)
+
+            merged_questions.append(
+                {
+                    "index": oq_dict.get("index", ""),
+                    "title": oq_dict.get("title", ""),
+                    "answer": self._clean_markdown(new_answer),
+                }
+            )
+        guarded["questions"] = merged_questions
+
+        return guarded
+
+    def final_review_with_reference(
+        self,
+        context: Dict[str, Any],
+        reference_pdf_path: str,
+    ) -> Dict[str, Any]:
+        """在最终汇总阶段基于整份参考 PDF 做一次全量审阅修复（complex 模型）"""
+        reference_text = self._read_pdf_text(reference_pdf_path)
+        if not reference_text:
+            return context
+
+        review_prompt = f"""你是计算机网络课程作业的终审老师。请对当前作业进行一次“全量最终审阅修复”。
+
+你将收到：
+1. 当前作业 JSON（包含选择题答案数组 ans、简答题 questions、程序设计题 gitee_info）；
+2. 参考答案 PDF 的完整文本内容。
+
+任务要求：
+1. 仅在“确定存在事实错误、答案错误、明显表达问题”时才修复。
+2. 选择题只允许修正 ans 数组中对应题号的位置内容，保持数组长度和索引语义不变。
+3. 简答题只修正 answer 字段，不改 index/title。
+4. 严禁修改第三部分 gitee_info（程序设计题 Git 地址）。该字段必须与输入 JSON 完全一致。
+5. 保持大二学生风格、实验报告语气、纯文本回答（无 Markdown）。
+6. 若参考答案文本与题意冲突，以题目知识点与事实正确性为准，不可盲从。
+7. 以“在原文基础上最小改动”为原则：能不改就不改，禁止整段改写、扩写或重写文风。
+8. 去 AI 文风：表达自然、简洁、像学生本人写作，避免模板化套话。
+9. 减少括号表达：除必要术语外，不要添加括号补充说明，不要用括号做不必要解释。
+10. 严格输出完整 JSON 对象，不要输出解释文字。
+11. 选择题答案格式必须为大写字母选项（如 A、AB、ACD），不得出现中文说明或标点。
+
+输出格式硬约束（必须全部满足）：
+1. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
+2. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出任何前后缀说明。
+3. 顶层结构必须与输入 JSON 同构，字段名保持一致。
+
+当前作业 JSON：
+{json.dumps(context, ensure_ascii=False)}
+
+参考答案 PDF 全文：
+{reference_text}
+"""
+
+        review_res = self._call_ai(
+            self.complex_client,
+            self.complex_model,
+            [{"role": "user", "content": review_prompt}],
+            use_tools=False,
+            response_format={"type": "json_object"},
+        )
+
+        if not review_res or not hasattr(review_res, "choices"):
+            return context
+
+        review_content = review_res.choices[0].message.content
+        if not review_content:
+            return context
+
+        try:
+            reviewed_context = self._parse_json_safe(review_content)
+            return self._guard_context_update(context, reviewed_context)
+        except Exception as e:
+            print(f">>> [警告] 最终全量审阅 JSON 解析失败，保留原结果: {e}")
+
+        return context
+
+    def run(self, pdf_path: str, reference_pdf_path: str = ""):
         print(f">>> 开始解析 PDF: {pdf_path}")
         homework_name, parts, screenshots = self.parse_pdf(pdf_path)
         print(f">>> 作业名称: {homework_name}")
 
+        if reference_pdf_path:
+            if os.path.exists(reference_pdf_path):
+                print(f">>> 检测到参考答案 PDF: {reference_pdf_path}")
+                print(">>> 最终全量审阅将直接使用整份参考 PDF 内容...")
+            else:
+                print(
+                    f">>> [警告] 参考答案 PDF 不存在: {reference_pdf_path}，将忽略最终参考修复"
+                )
+                reference_pdf_path = ""
+
         print(">>> 正在处理选择题...")
         ans = self.solve_choice_questions(
-            parts["choice"], screenshots.get("choice", {})
+            parts["choice"],
+            screenshots.get("choice", {}),
         )
 
         print(">>> 正在处理简答题...")
         questions = self.solve_short_answers(
-            parts["short_answer"], screenshots.get("short_answer", {})
+            parts["short_answer"],
+            screenshots.get("short_answer", {}),
         )
 
         print(">>> 正在处理程序设计题...")
         gitee_info = self.handle_programming(parts["programming"])
 
-        context = {
+        context: Dict[str, Any] = {
             "homework_name": homework_name,
             "class_name": self.config["student_info"]["class"],
             "student_id": self.config["student_info"]["id"],
@@ -937,6 +1184,10 @@ class HomeworkAutomator:
             "questions": questions,
             "gitee_info": gitee_info,
         }
+
+        if reference_pdf_path:
+            print(">>> 正在使用 complex 模型执行最终全量审阅修复...")
+            context = self.final_review_with_reference(context, reference_pdf_path)
 
         output_file = self.generate_docx(homework_name, context)
         print(f"\n[成功] 作业已生成: {output_file}")
@@ -953,7 +1204,12 @@ class HomeworkAutomator:
                 adjustment_prompt = f"""用户对生成的作业提出了修改意见："{feedback}"
 请根据意见调整当前的作业内容。
 当前内容：{json.dumps(context, ensure_ascii=False)}
-要求：严格输出调整后的完整 JSON。
+
+要求：
+1. 严格输出调整后的完整 JSON。
+2. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
+3. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出解释文字。
+4. 选择题 ans 的每一项只能是大写字母选项组合（如 A、AB、ACD），不得包含中文、标点和前缀文本。
 """
                 adj_res = self._call_ai(
                     self.complex_client,
@@ -965,23 +1221,44 @@ class HomeworkAutomator:
                     continue
                 adj_content = adj_res.choices[0].message.content
                 if adj_content:
-                    context = json.loads(adj_content)
+                    try:
+                        adjusted_context = self._parse_json_safe(adj_content)
+                        context = self._guard_context_update(context, adjusted_context)
+                    except Exception as e:
+                        print(f">>> [警告] 反馈修复 JSON 解析失败，保留原内容: {e}")
+                        continue
                     output_file = self.generate_docx(homework_name, context)
                     print(f"\n[成功] 已根据反馈重新生成作业: {output_file}")
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
 
     pdf_files = [f for f in os.listdir(".") if f.endswith(".pdf")]
     if not pdf_files:
         print("未找到 PDF 文件。")
         sys.exit(1)
-    target_pdf = pdf_files[0]
-    if len(sys.argv) > 1:
-        target_pdf = sys.argv[1]
+
+    parser = argparse.ArgumentParser(description="自动化解析并生成作业文档")
+    parser.add_argument(
+        "target_pdf",
+        nargs="?",
+        default=pdf_files[0],
+        help="待处理作业 PDF 路径（默认使用当前目录首个 PDF）",
+    )
+    parser.add_argument(
+        "--reference-pdf",
+        default="",
+        help="参考答案 PDF 路径（可选，仅在最终阶段做一次全量审阅修复）",
+    )
+    args = parser.parse_args()
+
+    target_pdf = args.target_pdf
+    reference_pdf = args.reference_pdf
+
     try:
         automator = HomeworkAutomator()
-        automator.run(target_pdf)
+        automator.run(target_pdf, reference_pdf)
     except Exception as e:
         print(f"\n[错误] 运行失败: {e}")
