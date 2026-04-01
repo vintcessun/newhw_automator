@@ -388,17 +388,24 @@ class HomeworkAutomator:
             else:
                 print(
                     f">>> 警告: 关键词 '{kw}' 未命中任何页，已回退为仅使用页码筛选结果"
-                )
-
-        if exclude_keyword:
-            ex_kw = exclude_keyword.strip()
-            kept_pages = [(pn, t) for pn, t in page_texts if ex_kw.lower() not in t.lower()]
-            removed_count = len(page_texts) - len(kept_pages)
-            if kept_pages:
-                print(
-                    f">>> 使用排除关键词筛选: '{ex_kw}' (排除 {removed_count} 页，保留 {len(kept_pages)} 页)"
-                )
-                page_texts = kept_pages
+            if ex_kw:
+                kept_pages = [
+                    (pn, t)
+                    for pn, t in page_texts
+                    if ex_kw.lower() not in t.lower()
+                ]
+                removed_count = len(page_texts) - len(kept_pages)
+                if kept_pages:
+                    print(
+                        f">>> 使用排除关键词筛选: '{ex_kw}' (排除 {removed_count} 页，保留 {len(kept_pages)} 页)"
+                    )
+                    page_texts = kept_pages
+                else:
+                    print(
+                        f">>> 警告: 排除关键词 '{ex_kw}' 导致结果为空，已回退为筛选前结果"
+                    )
+            else:
+                print(">>> 警告: 排除关键词为空白，已忽略排除筛选")
             else:
                 print(
                     f">>> 警告: 排除关键词 '{ex_kw}' 导致结果为空，已回退为筛选前结果"
