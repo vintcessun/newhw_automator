@@ -4,6 +4,9 @@ import json
 import re
 import requests
 import time
+import argparse
+import zipfile
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Tuple
 from openai import OpenAI, APIConnectionError, InternalServerError
 from docxtpl import DocxTemplate
@@ -260,13 +263,144 @@ class HomeworkAutomator:
                 return response
         return response
 
-    def parse_pdf(self, pdf_path: str) -> Tuple[str, Dict[str, Any]]:
+    def _parse_page_spec(self, page_spec: str, total_pages: int) -> List[int]:
+        """将 1-based 页码表达式解析为 0-based 下标列表，如 1-3,5,8-10"""
+        selected = set()
+        for part in page_spec.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            if "-" in token:
+                left, right = token.split("-", 1)
+                if not left.strip().isdigit() or not right.strip().isdigit():
+                    raise ValueError(f"非法页码范围: {token}")
+                start = int(left.strip())
+                end = int(right.strip())
+                if start > end:
+                    raise ValueError(f"页码范围起止错误: {token}")
+                for p in range(start, end + 1):
+                    if 1 <= p <= total_pages:
+                        selected.add(p - 1)
+            else:
+                if not token.isdigit():
+                    raise ValueError(f"非法页码: {token}")
+                p = int(token)
+                if 1 <= p <= total_pages:
+                    selected.add(p - 1)
+
+        if not selected:
+            raise ValueError("页码筛选后为空，请检查 --pages 参数")
+        return sorted(selected)
+
+    def _load_ppt_evidence(self, evidence_paths: List[str], ppt_keyword: str = "") -> str:
+        """读取一个或多个课件文件（.pptx/.pdf）文本内容，作为额外证据源"""
+        if not evidence_paths:
+            return ""
+
+        kw = ppt_keyword.strip().lower() if ppt_keyword else ""
+        blocks = []
+        total_units = 0
+        kept_units = 0
+        for evidence_path in evidence_paths:
+            if not os.path.exists(evidence_path):
+                raise FileNotFoundError(f"未找到课件文件: {evidence_path}")
+            ext = os.path.splitext(evidence_path)[1].lower()
+
+            slide_texts = []
+            if ext == ".pptx":
+                with zipfile.ZipFile(evidence_path, "r") as zf:
+                    slide_names = sorted(
+                        [n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")]
+                    )
+                    for slide_name in slide_names:
+                        total_units += 1
+                        xml_bytes = zf.read(slide_name)
+                        root = ET.fromstring(xml_bytes)
+                        texts = [node.text.strip() for node in root.iter() if node.tag.endswith("}t") and node.text and node.text.strip()]
+                        if texts:
+                            slide_text = " ".join(texts)
+                            if not kw or kw in slide_text.lower():
+                                slide_texts.append(slide_text)
+                                kept_units += 1
+            elif ext == ".pdf":
+                reader = PdfReader(evidence_path)
+                for page in reader.pages:
+                    total_units += 1
+                    page_text = page.extract_text() or ""
+                    if page_text.strip() and (not kw or kw in page_text.lower()):
+                        slide_texts.append(page_text)
+                        kept_units += 1
+            else:
+                raise ValueError(f"仅支持 .pptx 或 .pdf 课件文件: {evidence_path}")
+
+            if slide_texts:
+                blocks.append(
+                    f"[EVIDENCE:{os.path.basename(evidence_path)}]\n" + "\n".join(slide_texts)
+                )
+
+        if kw:
+            print(f">>> 课件关键词筛选命中: {kept_units}/{total_units} 页")
+            if kept_units == 0:
+                print(">>> 警告: 课件关键词未命中任何页，将不注入课件证据")
+
+        evidence = "\n\n".join(blocks).strip()
+        if len(evidence) > 12000:
+            evidence = evidence[:12000] + "\n...(课件证据已截断)"
+        return evidence
+
+    def parse_pdf(
+        self,
+        pdf_path: str,
+        page_spec: str = "",
+        keyword: str = "",
+        exclude_keyword: str = "",
+    ) -> Tuple[str, Dict[str, Any]]:
         """解析PDF并利用LLM提取四个部分的内容"""
         print(">>> 正在提取 PDF 文本...")
         reader = PdfReader(pdf_path)
-        full_text = ""
-        for page in reader.pages:
-            full_text += page.extract_text() + "\n"
+        total_pages = len(reader.pages)
+
+        if page_spec:
+            page_indexes = self._parse_page_spec(page_spec, total_pages)
+            print(
+                f">>> 使用页码范围筛选: {page_spec} (共选中 {len(page_indexes)} 页 / {total_pages} 页)"
+            )
+        else:
+            page_indexes = list(range(total_pages))
+
+        page_texts = []
+        for idx in page_indexes:
+            txt = reader.pages[idx].extract_text() or ""
+            page_texts.append((idx + 1, txt))
+
+        if keyword:
+            kw = keyword.strip()
+            keyword_pages = [(pn, t) for pn, t in page_texts if kw.lower() in t.lower()]
+            if keyword_pages:
+                print(
+                    f">>> 使用关键词筛选: '{kw}' (命中 {len(keyword_pages)} 页)"
+                )
+                page_texts = keyword_pages
+            else:
+                print(
+                    f">>> 警告: 关键词 '{kw}' 未命中任何页，已回退为仅使用页码筛选结果"
+                )
+
+        if exclude_keyword:
+            ex_kw = exclude_keyword.strip()
+            kept_pages = [(pn, t) for pn, t in page_texts if ex_kw.lower() not in t.lower()]
+            removed_count = len(page_texts) - len(kept_pages)
+            if kept_pages:
+                print(
+                    f">>> 使用排除关键词筛选: '{ex_kw}' (排除 {removed_count} 页，保留 {len(kept_pages)} 页)"
+                )
+                page_texts = kept_pages
+            else:
+                print(
+                    f">>> 警告: 排除关键词 '{ex_kw}' 导致结果为空，已回退为筛选前结果"
+                )
+
+        full_text = "\n".join(text for _, text in page_texts)
 
         print(">>> 正在使用 AI 解析作业结构...")
         prompt = f"""你是一个作业解析助手。请阅读以下从 PDF 中提取的乱序或复杂的文本，并将其整理为结构化的 JSON 格式。
@@ -364,7 +498,9 @@ PDF 文本：{full_text[:2000]}...
 
         return homework_name, parts
 
-    def solve_choice_questions(self, choices_list: List[Dict[str, Any]]) -> List[str]:
+    def solve_choice_questions(
+        self, choices_list: List[Dict[str, Any]], ppt_evidence: str = ""
+    ) -> List[str]:
         """使用复杂模型解决选择题 (CoT + 每题搜索 + 循环审阅)"""
         if not choices_list:
             return [""] * 20
@@ -411,6 +547,9 @@ PDF 文本：{full_text[:2000]}...
 
 【参考背景信息】：
 {json.dumps(current_batch_context, ensure_ascii=False)}
+
+【课程PPT证据】：
+{ppt_evidence if ppt_evidence else "无"}
 
 题目内容：
 {json.dumps(pending_choices, ensure_ascii=False)}
@@ -470,6 +609,7 @@ PDF 文本：{full_text[:2000]}...
 思路：{thought_str}
 答案：{answer_str}
 【参考背景信息】：{current_batch_context.get(qid, "无")}
+【课程PPT证据】：{ppt_evidence if ppt_evidence else "无"}
 
 核查要求（务必严谨）：
 1. 【事实核查是核心】：你的主要任务是判断推导思路是否符合计算机网络协议和逻辑事实。
@@ -518,7 +658,7 @@ PDF 文本：{full_text[:2000]}...
         return final_ans
 
     def solve_short_answers(
-        self, short_answer_list: List[Dict[str, Any]]
+        self, short_answer_list: List[Dict[str, Any]], ppt_evidence: str = ""
     ) -> List[Dict[str, Any]]:
         """使用复杂模型解决简答题，并由简单模型审阅（CoT 循环反馈机制）"""
         if not short_answer_list:
@@ -567,6 +707,9 @@ PDF 文本：{full_text[:2000]}...
 
 【参考背景信息】：
 {json.dumps(current_batch_context, ensure_ascii=False)}
+
+【课程PPT证据】：
+{ppt_evidence if ppt_evidence else "无"}
 
 待处理题目（包含题目和可能的反馈意见）：
 {json.dumps(pending_questions, ensure_ascii=False)}
@@ -621,6 +764,7 @@ PDF 文本：{full_text[:2000]}...
 题目：{title}
 回答：{ans}
 【参考背景信息】：{current_batch_context.get(qid, "暂无相关背景资料")}
+【课程PPT证据】：{ppt_evidence if ppt_evidence else "无"}
 
 审阅标准（事实优先）：
 1. 【考点核查】：确认回答是否命中了该题目的计算机网络核心知识点。
@@ -737,16 +881,31 @@ PDF 文本：{full_text[:2000]}...
         tpl.save(output_name)
         return output_name
 
-    def run(self, pdf_path: str):
+    def run(
+        self,
+        pdf_path: str,
+        page_spec: str = "",
+        keyword: str = "",
+        exclude_keyword: str = "",
+        ppt_paths: List[str] | None = None,
+        ppt_keyword: str = "",
+    ):
         print(f">>> 开始解析 PDF: {pdf_path}")
-        homework_name, parts = self.parse_pdf(pdf_path)
+        ppt_evidence = self._load_ppt_evidence(ppt_paths or [], ppt_keyword)
+        if ppt_evidence:
+            print(f">>> 已加载课件证据源: {len(ppt_paths or [])} 个")
+            if ppt_keyword:
+                print(f">>> 已启用课件关键词筛选: '{ppt_keyword}'")
+        homework_name, parts = self.parse_pdf(
+            pdf_path, page_spec, keyword, exclude_keyword
+        )
         print(f">>> 作业名称: {homework_name}")
 
         print(">>> 正在处理选择题...")
-        ans = self.solve_choice_questions(parts["choice"])
+        ans = self.solve_choice_questions(parts["choice"], ppt_evidence)
 
         print(">>> 正在处理简答题...")
-        questions = self.solve_short_answers(parts["short_answer"])
+        questions = self.solve_short_answers(parts["short_answer"], ppt_evidence)
 
         print(">>> 正在处理程序设计题...")
         gitee_info = self.handle_programming(parts["programming"])
@@ -794,17 +953,57 @@ PDF 文本：{full_text[:2000]}...
 
 
 if __name__ == "__main__":
-    import sys
+    parser = argparse.ArgumentParser(description="计算机网络作业自动生成工具")
+    parser.add_argument("pdf", nargs="?", help="作业 PDF 文件名（默认使用目录下第一个 PDF）")
+    parser.add_argument(
+        "--pages",
+        default="",
+        help="仅处理指定页码，格式如 1-3,5,8-10（页码从 1 开始）",
+    )
+    parser.add_argument(
+        "--keyword",
+        default="",
+        help="仅保留包含该关键词的页面文本（在 --pages 结果上再次筛选）",
+    )
+    parser.add_argument(
+        "--exclude-keyword",
+        default="",
+        help="排除包含该关键词的页面文本（在 --keyword 之后再筛选）",
+    )
+    parser.add_argument(
+        "--ppt",
+        nargs="*",
+        default=[],
+        help="兼容参数：额外证据源课件路径（支持 .pptx/.pdf），可传多个",
+    )
+    parser.add_argument(
+        "--evidence",
+        nargs="*",
+        default=[],
+        help="额外证据源课件路径（支持 .pptx/.pdf），可传多个，如 --evidence 第6课.pdf 第7课.pptx",
+    )
+    parser.add_argument(
+        "--ppt-keyword",
+        default="",
+        help="仅保留课件中包含该关键词的页文本（对 --ppt 生效）",
+    )
+    args = parser.parse_args()
 
     pdf_files = [f for f in os.listdir(".") if f.endswith(".pdf")]
-    if not pdf_files:
+    if not pdf_files and not args.pdf:
         print("未找到 PDF 文件。")
-        sys.exit(1)
-    target_pdf = pdf_files[0]
-    if len(sys.argv) > 1:
-        target_pdf = sys.argv[1]
+        raise SystemExit(1)
+    target_pdf = args.pdf if args.pdf else pdf_files[0]
     try:
         automator = HomeworkAutomator()
-        automator.run(target_pdf)
+        evidence_paths = (args.evidence or []) + (args.ppt or [])
+        automator.run(
+            target_pdf,
+            args.pages,
+            args.keyword,
+            args.exclude_keyword,
+            evidence_paths,
+            args.ppt_keyword,
+        )
     except Exception as e:
         print(f"\n[错误] 运行失败: {e}")
