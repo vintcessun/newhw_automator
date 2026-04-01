@@ -278,15 +278,17 @@ class HomeworkAutomator:
                 if not left.strip().isdigit() or not right.strip().isdigit():
                     raise ValueError(f"非法页码范围: {token}")
                 start = int(left.strip())
-                end = int(right.strip())
-                if start > end:
-                    raise ValueError(f"页码范围起止错误: {token}")
+                if start < 1 or end > total_pages:
+                    raise ValueError(f"页码范围越界: {token}（总页数为 {total_pages}）")
                 for p in range(start, end + 1):
-                    if 1 <= p <= total_pages:
-                        selected.add(p - 1)
+                    selected.add(p - 1)
             else:
                 if not token.isdigit():
                     raise ValueError(f"非法页码: {token}")
+                p = int(token)
+                if not (1 <= p <= total_pages):
+                    raise ValueError(f"页码越界: {p}（总页数为 {total_pages}）")
+                selected.add(p - 1)
                 p = int(token)
                 if 1 <= p <= total_pages:
                     selected.add(p - 1)
