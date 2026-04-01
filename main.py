@@ -981,11 +981,11 @@ if __name__ == "__main__":
         evidence_paths = (args.evidence or []) + (args.ppt or [])
         automator.run(
             target_pdf,
-            args.pages,
-            args.keyword,
-            args.exclude_keyword,
-            evidence_paths,
-            args.ppt_keyword,
-        )
-    except Exception as e:
+        nargs="+",
+        default=[],
+        help="兼容参数：额外证据源课件路径（支持 .pptx/.pdf），可传多个",
+    )
+    parser.add_argument(
+        "--evidence",
+        nargs="+",
         print(f"\n[错误] 运行失败: {e}")
