@@ -14,3 +14,4 @@ config.toml
 problems/
 *.docx
 !template.docx
+references/

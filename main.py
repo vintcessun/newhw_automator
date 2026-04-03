@@ -553,6 +553,7 @@ class HomeworkAutomator:
         self,
         choices_list: List[Dict[str, Any]],
         image_map: Dict[str, str],
+        reference_materials_text: str = "无",
     ) -> List[str]:
         """使用复杂模型解决选择题 (CoT + 每题搜索 + 循环审阅)"""
         if not choices_list:
@@ -584,7 +585,7 @@ class HomeworkAutomator:
 
 要求使用 Chain-of-Thought (CoT) 模式：
 1. 深入分析题目背景，并在 <thought> 标签内明确列出【考察知识点】。
-2. 参考提供的【参考背景信息】辅助推导。
+2. 优先参考提供的【参考资料】与【参考背景信息】辅助推导。
 3. 展现分步骤推导逻辑。
 4. 最终答案必须写在 <answer> 标签内，且只能包含大写字母选项（如 A、AB、ACD），不得包含中文、标点、括号、前缀文本（如“答案：”）。
 
@@ -608,7 +609,10 @@ class HomeworkAutomator:
   ]
 }}
 
-【参考背景信息】：
+【参考资料】（启动时加载的参考文件）：
+{reference_materials_text}
+
+【参考背景信息】（当前轮次搜索结果）：
 {json.dumps(current_batch_context, ensure_ascii=False)}
 
 题目内容：
@@ -674,6 +678,9 @@ class HomeworkAutomator:
 题目：{q.get('question')}
 思路：{thought_str}
 答案：{answer_str}
+【参考资料】（启动时加载的参考文件）：
+{reference_materials_text}
+
 【参考背景信息】：{current_batch_context.get(qid, "无")}
 
 核查要求（务必严谨）：
@@ -730,6 +737,7 @@ class HomeworkAutomator:
         self,
         short_answer_list: List[Dict[str, Any]],
         image_map: Dict[str, str],
+        reference_materials_text: str = "无",
     ) -> List[Dict[str, Any]]:
         """使用复杂模型解决简答题，并由简单模型审阅（CoT 循环反馈机制）"""
         if not short_answer_list:
@@ -757,7 +765,7 @@ class HomeworkAutomator:
 
             solve_prompt = f"""你是一个大二学生 {student_name}。正在完成计算机网络作业。
 要求使用 CoT 模式进行推理：
-1. 在 <thought> 标签内首先明确列出该题目的【考察知识点】，结合【参考背景信息】和之前的【反馈意见】（如果有）进行逻辑推导。
+1. 在 <thought> 标签内首先明确列出该题目的【考察知识点】，结合【参考资料】、【参考背景信息】和之前的【反馈意见】（如果有）进行逻辑推导。
 2. 将最终给出的纯文本回答写在 <answer> 标签内。
 3. 回答要求（严禁 Markdown，语气严谨）：
    - 语气正式、专业且客观，采用严谨的【实验报告】风格。
@@ -785,7 +793,10 @@ class HomeworkAutomator:
     }}
   ]
 }}
-【参考背景信息】：
+【参考资料】（启动时加载的参考文件）：
+{reference_materials_text}
+
+【参考背景信息】（当前轮次搜索结果）：
 {json.dumps(current_batch_context, ensure_ascii=False)}
 
 待处理题目（包含题目和可能的反馈意见）：
@@ -844,6 +855,9 @@ class HomeworkAutomator:
                 review_prompt = f"""你是一个计算机网络审阅专家。请严谨审阅以下简答题答案。
 题目：{title}
 回答：{ans}
+【参考资料】（启动时加载的参考文件）：
+{reference_materials_text}
+
 【参考背景信息】：{current_batch_context.get(qid, "暂无相关背景资料")}
 
 审阅标准（事实优先）：
@@ -1002,7 +1016,7 @@ class HomeworkAutomator:
         return json.loads(content)
 
     def _read_pdf_text(self, pdf_path: str) -> str:
-        """读取整份 PDF 文本，用于最终全量审阅对照"""
+        """读取整份 PDF 文本"""
         try:
             reader = PdfReader(pdf_path)
             chunks = []
@@ -1016,6 +1030,55 @@ class HomeworkAutomator:
         except Exception as e:
             print(f">>> [警告] 读取参考 PDF 文本失败: {e}")
             return ""
+
+    def _read_md_text(self, md_path: str) -> str:
+        """读取 Markdown 文本内容"""
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            max_chars = 40000
+            if len(text) > max_chars:
+                return text[:max_chars]
+            return text
+        except Exception as e:
+            print(f">>> [警告] 读取参考 Markdown 文本失败: {e}")
+            return ""
+
+    def _prepare_reference_materials(
+        self,
+        reference_pdf_paths: List[str],
+        reference_md_paths: List[str],
+    ) -> str:
+        """加载参考 PDF/MD，并整理为每题都可复用的参考资料文本"""
+        blocks: List[str] = []
+
+        def _append_block(kind: str, src_path: str, content: str):
+            if not content:
+                return
+            blocks.append(
+                f"[参考文件] 类型: {kind}\n路径: {src_path}\n内容:\n{content}"
+            )
+
+        for p in reference_pdf_paths:
+            if not os.path.exists(p):
+                print(f">>> [警告] 参考 PDF 不存在，已忽略: {p}")
+                continue
+            _append_block("pdf", p, self._read_pdf_text(p))
+
+        for p in reference_md_paths:
+            if not os.path.exists(p):
+                print(f">>> [警告] 参考 Markdown 不存在，已忽略: {p}")
+                continue
+            _append_block("md", p, self._read_md_text(p))
+
+        if not blocks:
+            return "无"
+
+        joined = "\n\n".join(blocks)
+        max_chars = 120000
+        if len(joined) > max_chars:
+            return joined[:max_chars]
+        return joined
 
     def _guard_context_update(
         self,
@@ -1081,95 +1144,42 @@ class HomeworkAutomator:
 
         return guarded
 
-    def final_review_with_reference(
+    def run(
         self,
-        context: Dict[str, Any],
-        reference_pdf_path: str,
-    ) -> Dict[str, Any]:
-        """在最终汇总阶段基于整份参考 PDF 做一次全量审阅修复（complex 模型）"""
-        reference_text = self._read_pdf_text(reference_pdf_path)
-        if not reference_text:
-            return context
-
-        review_prompt = f"""你是计算机网络课程作业的终审老师。请对当前作业进行一次“全量最终审阅修复”。
-
-你将收到：
-1. 当前作业 JSON（包含选择题答案数组 ans、简答题 questions、程序设计题 gitee_info）；
-2. 参考答案 PDF 的完整文本内容。
-
-任务要求：
-1. 仅在“确定存在事实错误、答案错误、明显表达问题”时才修复。
-2. 选择题只允许修正 ans 数组中对应题号的位置内容，保持数组长度和索引语义不变。
-3. 简答题只修正 answer 字段，不改 index/title。
-4. 严禁修改第三部分 gitee_info（程序设计题 Git 地址）。该字段必须与输入 JSON 完全一致。
-5. 保持大二学生风格、实验报告语气、纯文本回答（无 Markdown）。
-6. 若参考答案文本与题意冲突，以题目知识点与事实正确性为准，不可盲从。
-7. 以“在原文基础上最小改动”为原则：能不改就不改，禁止整段改写、扩写或重写文风。
-8. 去 AI 文风：表达自然、简洁、像学生本人写作，避免模板化套话。
-9. 减少括号表达：除必要术语外，不要添加括号补充说明，不要用括号做不必要解释。
-10. 严格输出完整 JSON 对象，不要输出解释文字。
-11. 选择题答案格式必须为大写字母选项（如 A、AB、ACD），不得出现中文说明或标点。
-
-输出格式硬约束（必须全部满足）：
-1. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
-2. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出任何前后缀说明。
-3. 顶层结构必须与输入 JSON 同构，字段名保持一致。
-
-当前作业 JSON：
-{json.dumps(context, ensure_ascii=False)}
-
-参考答案 PDF 全文：
-{reference_text}
-"""
-
-        review_res = self._call_ai(
-            self.complex_client,
-            self.complex_model,
-            [{"role": "user", "content": review_prompt}],
-            use_tools=False,
-            response_format={"type": "json_object"},
-        )
-
-        if not review_res or not hasattr(review_res, "choices"):
-            return context
-
-        review_content = review_res.choices[0].message.content
-        if not review_content:
-            return context
-
-        try:
-            reviewed_context = self._parse_json_safe(review_content)
-            return self._guard_context_update(context, reviewed_context)
-        except Exception as e:
-            print(f">>> [警告] 最终全量审阅 JSON 解析失败，保留原结果: {e}")
-
-        return context
-
-    def run(self, pdf_path: str, reference_pdf_path: str = ""):
+        pdf_path: str,
+        reference_pdf_paths: Optional[List[str]] = None,
+        reference_md_paths: Optional[List[str]] = None,
+    ):
         print(f">>> 开始解析 PDF: {pdf_path}")
         homework_name, parts, screenshots = self.parse_pdf(pdf_path)
         print(f">>> 作业名称: {homework_name}")
 
-        if reference_pdf_path:
-            if os.path.exists(reference_pdf_path):
-                print(f">>> 检测到参考答案 PDF: {reference_pdf_path}")
-                print(">>> 最终全量审阅将直接使用整份参考 PDF 内容...")
-            else:
-                print(
-                    f">>> [警告] 参考答案 PDF 不存在: {reference_pdf_path}，将忽略最终参考修复"
-                )
-                reference_pdf_path = ""
+        reference_pdf_paths = reference_pdf_paths or []
+        reference_md_paths = reference_md_paths or []
+        reference_materials_text = self._prepare_reference_materials(
+            reference_pdf_paths,
+            reference_md_paths,
+        )
+        if reference_materials_text != "无":
+            print(
+                f">>> 已加载参考资料: PDF {len(reference_pdf_paths)} 个, MD {len(reference_md_paths)} 个"
+            )
+            print(">>> 后续每次题目生成与审阅都会附带这些参考资料作为上下文...")
+        else:
+            print(">>> 未加载到有效参考资料，将仅使用题目截图与检索背景进行作答。")
 
         print(">>> 正在处理选择题...")
         ans = self.solve_choice_questions(
             parts["choice"],
             screenshots.get("choice", {}),
+            reference_materials_text,
         )
 
         print(">>> 正在处理简答题...")
         questions = self.solve_short_answers(
             parts["short_answer"],
             screenshots.get("short_answer", {}),
+            reference_materials_text,
         )
 
         print(">>> 正在处理程序设计题...")
@@ -1184,10 +1194,6 @@ class HomeworkAutomator:
             "questions": questions,
             "gitee_info": gitee_info,
         }
-
-        if reference_pdf_path:
-            print(">>> 正在使用 complex 模型执行最终全量审阅修复...")
-            context = self.final_review_with_reference(context, reference_pdf_path)
 
         output_file = self.generate_docx(homework_name, context)
         print(f"\n[成功] 作业已生成: {output_file}")
@@ -1249,16 +1255,38 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--reference-pdf",
-        default="",
-        help="参考答案 PDF 路径（可选，仅在最终阶段做一次全量审阅修复）",
+        action="append",
+        default=[],
+        help="参考答案 PDF 路径（可多次传入，将在每次题目生成与审阅时附带）",
+    )
+    parser.add_argument(
+        "--reference-md",
+        action="append",
+        default=[],
+        help="参考 Markdown 路径（可多次传入，将在每次题目生成与审阅时附带）",
     )
     args = parser.parse_args()
 
     target_pdf = args.target_pdf
-    reference_pdf = args.reference_pdf
+    reference_pdfs = args.reference_pdf
+    reference_mds = args.reference_md
+
+    print("\n>>> 命令行参数解析结果:")
+    print(f">>> target_pdf: {target_pdf}")
+    print(f">>> reference_pdfs ({len(reference_pdfs)}):")
+    for i, p in enumerate(reference_pdfs, start=1):
+        print(f"    {i}. {p}")
+    if not reference_pdfs:
+        print("    (无)")
+
+    print(f">>> reference_mds ({len(reference_mds)}):")
+    for i, p in enumerate(reference_mds, start=1):
+        print(f"    {i}. {p}")
+    if not reference_mds:
+        print("    (无)")
 
     try:
         automator = HomeworkAutomator()
-        automator.run(target_pdf, reference_pdf)
+        automator.run(target_pdf, reference_pdfs, reference_mds)
     except Exception as e:
         print(f"\n[错误] 运行失败: {e}")
