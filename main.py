@@ -14,7 +14,7 @@ import numpy as np
 
 
 class HomeworkAutomator:
-    CHOICE_QUESTION_LIMIT = 30
+    CHOICE_QUESTION_LIMIT = 50
 
     def __init__(self, config_path: str = "config.toml"):
         self.config = self._load_config(config_path)
