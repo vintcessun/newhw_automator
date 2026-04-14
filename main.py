@@ -5,6 +5,7 @@ import re
 import base64
 import requests
 import time
+from copy import deepcopy
 from typing import List, Dict, Any, Tuple, Optional, cast
 from openai import OpenAI, APIConnectionError, InternalServerError
 from docxtpl import DocxTemplate
@@ -746,11 +747,15 @@ class HomeworkAutomator:
         student_name = self.config["student_info"]["name"]
         pending_questions = short_answer_list.copy()
         final_results_map = {}
+        best_answers_per_q = {}  # 记录每题的最好答案
+        no_improvement_rounds = 0  # 连续无进展轮数
 
         max_rounds = 10
         for round_idx in range(max_rounds):
             if not pending_questions:
                 break
+
+            round_improved = False
 
             print(
                 f"\n>>> 简答题处理第 {round_idx + 1} 轮 (剩余 {len(pending_questions)} 题)..."
@@ -766,12 +771,21 @@ class HomeworkAutomator:
             solve_prompt = f"""你是一个大二学生 {student_name}。正在完成计算机网络作业。
 要求使用 CoT 模式进行推理：
 1. 在 <thought> 标签内首先明确列出该题目的【考察知识点】，结合【参考资料】、【参考背景信息】和之前的【反馈意见】（如果有）进行逻辑推导。
-2. 将最终给出的纯文本回答写在 <answer> 标签内。
-3. 回答要求（严禁 Markdown，语气严谨）：
-   - 语气正式、专业且客观，采用严谨的【实验报告】风格。
-   - 严禁出现任何 Markdown 语法（如加粗 **、列表 -、代码块等）。
-   - 严禁出现大量括号解释，严禁中英文同时出现（除非是专有名词且非常有必要）。
-   - 逻辑推导严密，表述精炼，符合学术规范。
+2. 将最终给出的回答写在 <answer> 标签内。
+3. 回答要求（像学生交给老师的作业答案）：
+    - 语气自然、认真、书面化，像大学生写给任课老师看的课程作业，不要写成公文、论文摘要或审稿意见。
+     - 格式规则：
+         * 正文一律使用完整的中文段落，不能用 Markdown 加粗（**）、斜体（*）、无序列表（-）、有序列表、代码块等。
+         * 如果答案里确实有多个事物需要逐项对比或分类列举（例如比较两种协议的字段、列出多个阶段的参数），才在段落之后插入一个标准 Markdown 表格；没有对比/分类需求就不用表格，直接写段落。
+         * 表格格式：第一行是表头，第二行是分隔行（如 |---|---|），之后是数据行，每行都要有 | 开头和结尾。
+     - 可读性硬约束：
+         * 先给结论，再解释原因；不要先铺垫一大段抽象定义。
+         * 句子尽量短，每句只表达一个核心意思，避免长串并列从句。
+         * 专业术语可以直接使用，不要求逐个解释；但禁止堆砌生僻词、空话套话和夸张修辞。
+         * 必须正确使用中文标点。每个分句都要有逗号、句号、分号等停顿标记，禁止整段只靠空格或连词硬拼。
+         * 单句过长时必须主动断句。不要连续输出超长复合句，避免“一句话塞满整段信息”。
+     - 文字风格：自然流畅，允许少量口语化连接词（如“可以理解为”“这里的关键是”），但结论必须准确；避免大量堆砌"首先/其次/再次/最后"或"一、二、三、四"式的机械分点；少用括号解释，禁止写成长段华丽但信息密度低的句子。
+     - 内容要正确、完整，把原理和原因讲清楚。
    - 仅限中文，除了必要的英文专业术语。
 
 输出格式硬约束（必须全部满足）：
@@ -860,13 +874,21 @@ class HomeworkAutomator:
 
 【参考背景信息】：{current_batch_context.get(qid, "暂无相关背景资料")}
 
-审阅标准（事实优先）：
-1. 【考点核查】：确认回答是否命中了该题目的计算机网络核心知识点。
-2. 【推导验证】：重点核查推导逻辑。由于题目是新出的，请利用工具核查其引用的原理、协议细节或计算公式是否准确。
-3. 【文风审查】：语气必须正式、专业、客观，符合严谨的实验报告规范。严禁括号解释、严禁非必要的中英并列。
-4. 【格式要求】：必须是纯文本，无 Markdown。
+审阅标准（核心优先 - 允许小缺陷）：
+1. 【知识点与逻辑】（最关键）：回答是否准确命中该题的计算机网络核心知识点？推导逻辑是否正确？允许有小的计算或细节错误，但原理必须对。
+2. 【可读性】（次关键）：是否能看懂？允许有小的标点缺陷或断句不完美，只要能读、有逻辑就可以。严格反对：无标点堆砌、华丽但无信息、机械套话。
+3. 【文风审查】：文风应自然、清楚、像学生提交给老师的课程作业答案。重点检查是否“可读易懂”：
+    - 是否先给结论再解释；
+    - 是否存在过长句、术语堆叠、空话套话；
+    - 是否出现华丽修辞但缺少有效信息。
+    - 标点是否完整、断句是否清晰；若出现无标点堆砌或超长句连写，判为不通过。
+    若存在晦涩难懂、学术腔过重、机械分点或括号解释过多，判为不通过。
+4. 【格式要求】：正文必须是完整中文段落，禁止使用加粗、斜体、列表、代码块等 Markdown 语法。如果答案里包含多项对比或分类列举，应在段落后出现标准 Markdown 表格（含表头行和分隔行）；如果没有使用表格但内容明显需要对比，请指出。
 
-要求：完全合格则输出中含有 "PASS"，否则不含有 "PASS" 并指出具体错误。
+输出硬约束（必须遵守）：
+1. 若该答案可接受（允许小缺陷），你的回复必须包含大写字符串 "PASS"。
+2. 若该答案不可接受，你的回复必须不包含 "PASS"，并给出一句具体错误原因。
+3. 禁止输出模糊结论（例如“基本可以”“差不多”）。
 """
                 review_messages = self._build_image_message(
                     review_prompt,
@@ -882,7 +904,18 @@ class HomeworkAutomator:
                 if not rev_res or not hasattr(rev_res, "choices"):
                     continue
                 rev_content = rev_res.choices[0].message.content
-                if rev_content and "PASS" in rev_content.strip().upper():
+
+                # 更新最佳答案记录
+                if qid not in best_answers_per_q or len(ans) > len(
+                    best_answers_per_q[qid][0]
+                ):
+                    best_answers_per_q[qid] = (ans, q.get("id", ""), title)
+                    round_improved = True
+
+                # 通过判定唯一标准：审阅回复中包含 PASS
+                is_pass = bool(rev_content and "PASS" in rev_content.upper())
+
+                if is_pass:
                     print(f"  [题号 {qid}] 审阅通过")
                     final_results_map[qid] = {
                         "index": q.get("id", ""),
@@ -891,12 +924,29 @@ class HomeworkAutomator:
                     }
                 else:
                     reason = rev_content.strip() if rev_content else "审阅未通过"
-                    print(f"  [题号 {qid}] 审阅未通过: {reason}")
+                    print(f"  [题号 {qid}] 审阅未通过: {reason[:100]}")
                     q_with_feedback = q.copy()
                     q_with_feedback["feedback"] = reason  # 修复
                     still_pending.append(q_with_feedback)
 
             pending_questions = still_pending
+
+            # 早停机制：连续3轮无进展则用最佳答案强制通过
+            if not round_improved:
+                no_improvement_rounds += 1
+            else:
+                no_improvement_rounds = 0
+
+            if no_improvement_rounds >= 3:
+                print(f"\n>>> [提示] 连续 3 轮无进展，使用最佳答案强制通过剩余题目...")
+                for qid, (best_ans, q_index, q_title) in best_answers_per_q.items():
+                    if qid not in final_results_map:
+                        final_results_map[qid] = {
+                            "index": q_index,
+                            "title": q_title,
+                            "answer": best_ans,
+                        }
+                break
 
         # 整理结果
         results = []
@@ -946,6 +996,10 @@ class HomeworkAutomator:
         """强力去除文本中的 Markdown 语法，返回纯文本"""
         if not text:
             return ""
+        # 如果不是字符串（例如是 Subdoc 对象），直接返回
+        if not isinstance(text, str):
+            return text
+
         # 1. 去除代码块标识
         text = re.sub(r"```.*?```", "", text, flags=re.S)
         # 2. 去除加粗/斜体
@@ -965,15 +1019,114 @@ class HomeworkAutomator:
         text = re.sub(r"^[\s\t]*\d+\.\s+", "", text, flags=re.M)
         return text.strip()
 
-    def generate_docx(self, homework_name: str, context: Dict[str, Any]):
-        """生成最终的 docx 文件，包含兜底清理"""
-        # 对 context 中的所有文本内容进行兜底清理
-        if "questions" in context:
-            for q in context["questions"]:
-                q["answer"] = self._clean_markdown(q["answer"])
+    def _text_to_subdoc(self, tpl: DocxTemplate, text: str):
+        """将包含 Markdown 表格的文本转换为 Subdoc 对象以插入原生 Word 内容"""
 
+        def _is_table_line(line: str) -> bool:
+            s = line.strip()
+            return s.count("|") >= 2
+
+        def _is_separator_line(line: str) -> bool:
+            # 兼容 --- / :--- / ---: / :---: 等 Markdown 分隔行
+            s = line.strip()
+            if not s:
+                return False
+            if s.startswith("|"):
+                s = s[1:]
+            if s.endswith("|"):
+                s = s[:-1]
+            cells = [c.strip() for c in s.split("|")]
+            if not cells:
+                return False
+            for c in cells:
+                if not c:
+                    return False
+                if not re.fullmatch(r":?-{3,}:?", c):
+                    return False
+            return True
+
+        def _split_row_cells(line: str) -> List[str]:
+            s = line.strip()
+            if s.startswith("|"):
+                s = s[1:]
+            if s.endswith("|"):
+                s = s[:-1]
+            return [c.strip() for c in s.split("|")]
+
+        sd = tpl.new_subdoc()
+        if not text or not isinstance(text, str):
+            return sd
+
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            cur = lines[i].rstrip()
+
+            # 探测 Markdown 表格块：当前行像表格，且下一行是分隔线
+            if (
+                i + 1 < len(lines)
+                and _is_table_line(cur)
+                and _is_separator_line(lines[i + 1])
+            ):
+                table_lines = [cur, lines[i + 1].rstrip()]
+                j = i + 2
+                while j < len(lines):
+                    nxt = lines[j].rstrip()
+                    if not nxt.strip() or not _is_table_line(nxt):
+                        break
+                    table_lines.append(nxt)
+                    j += 1
+
+                rows_data: List[List[str]] = []
+                for raw in table_lines:
+                    if _is_separator_line(raw):
+                        continue
+                    cells = _split_row_cells(raw)
+                    if any(c.strip() for c in cells):
+                        rows_data.append(cells)
+
+                if rows_data:
+                    num_rows = len(rows_data)
+                    num_cols = max(len(r) for r in rows_data)
+                    table = sd.add_table(rows=num_rows, cols=num_cols)
+                    table.style = "Table Grid"
+                    for r_idx, row_cells in enumerate(rows_data):
+                        padded = row_cells + [""] * (num_cols - len(row_cells))
+                        for c_idx, cell_text in enumerate(padded):
+                            table.cell(r_idx, c_idx).text = self._clean_markdown(
+                                cell_text
+                            )
+                    sd.add_paragraph("")
+                else:
+                    fallback_text = self._clean_markdown("\n".join(table_lines))
+                    if fallback_text:
+                        sd.add_paragraph(fallback_text)
+
+                i = j
+                continue
+
+            cleaned = self._clean_markdown(cur)
+            if cleaned:
+                sd.add_paragraph(cleaned)
+            i += 1
+
+        return sd
+
+    def generate_docx(self, homework_name: str, context: Dict[str, Any]):
+        """生成最终的 docx 文件，包含表格支持与兜底清理"""
         tpl = DocxTemplate("template.docx")
-        tpl.render(context)
+
+        # 不污染原始 context，避免后续反馈阶段 json.dumps(context) 遇到 Subdoc 序列化错误
+        render_context = deepcopy(context)
+
+        # 对渲染上下文中的简答题内容进行处理
+        # 模板使用 {{p q.answer }} 段落级替换，必须始终传入 Subdoc 对象
+        if "questions" in render_context:
+            for q in render_context["questions"]:
+                ans_text = q.get("answer", "")
+                q["answer"] = self._text_to_subdoc(tpl, ans_text)
+
+        tpl.render(render_context)
         tpl_any = cast(Any, tpl)
         safe_name = re.sub(r'[\\/:*?"<>|]', "_", homework_name)
         output_name = f"{safe_name}.docx"
@@ -1144,6 +1297,54 @@ class HomeworkAutomator:
 
         return guarded
 
+    def _get_cache_path(self, pdf_path: str) -> str:
+        """生成缓存文件路径"""
+        cache_dir = ".homework_cache"
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir, exist_ok=True)
+        # 基于PDF文件名生成缓存文件
+        pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        return os.path.join(cache_dir, f"{pdf_name}.cache.json")
+
+    def _load_cache(self, pdf_path: str) -> Optional[Dict[str, Any]]:
+        """加载缓存，若缓存比PDF新则返回缓存数据"""
+        cache_path = self._get_cache_path(pdf_path)
+
+        # 检查缓存文件是否存在
+        if not os.path.exists(cache_path):
+            return None
+
+        # 检查PDF是否存在及修改时间
+        if not os.path.exists(pdf_path):
+            return None
+
+        pdf_mtime = os.path.getmtime(pdf_path)
+        cache_mtime = os.path.getmtime(cache_path)
+
+        # 缓存如果比PDF新则有效
+        if cache_mtime <= pdf_mtime:
+            print(f">>> [缓存] 缓存已过期（PDF 已更新），将重新处理")
+            return None
+
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+            print(f">>> [缓存] 成功加载缓存: {cache_path}")
+            return cache_data
+        except Exception as e:
+            print(f">>> [缓存] 加载缓存失败: {e}，将重新处理")
+            return None
+
+    def _save_cache(self, pdf_path: str, cache_data: Dict[str, Any]) -> None:
+        """保存缓存数据"""
+        cache_path = self._get_cache_path(pdf_path)
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            print(f">>> [缓存] 已保存缓存: {cache_path}")
+        except Exception as e:
+            print(f">>> [缓存] 保存缓存失败: {e}")
+
     def run(
         self,
         pdf_path: str,
@@ -1168,22 +1369,51 @@ class HomeworkAutomator:
         else:
             print(">>> 未加载到有效参考资料，将仅使用题目截图与检索背景进行作答。")
 
-        print(">>> 正在处理选择题...")
-        ans = self.solve_choice_questions(
-            parts["choice"],
-            screenshots.get("choice", {}),
-            reference_materials_text,
-        )
+        # 尝试加载缓存
+        cache_data = self._load_cache(pdf_path)
+        if cache_data is None:
+            cache_data = {}
 
-        print(">>> 正在处理简答题...")
-        questions = self.solve_short_answers(
-            parts["short_answer"],
-            screenshots.get("short_answer", {}),
-            reference_materials_text,
-        )
+        # 处理选择题（检查缓存）
+        if "choice_ans" in cache_data and cache_data.get("choice_ans"):
+            print(">>> [缓存] 使用缓存的选择题答案")
+            ans = cache_data["choice_ans"]
+        else:
+            print(">>> 正在处理选择题...")
+            ans = self.solve_choice_questions(
+                parts["choice"],
+                screenshots.get("choice", {}),
+                reference_materials_text,
+            )
+            cache_data["choice_ans"] = ans
+            cache_data["choice_cached_at"] = time.time()
+            self._save_cache(pdf_path, cache_data)
 
-        print(">>> 正在处理程序设计题...")
-        gitee_info = self.handle_programming(parts["programming"])
+        # 处理简答题（检查缓存）
+        if "short_answers" in cache_data and cache_data.get("short_answers"):
+            print(">>> [缓存] 使用缓存的简答题答案")
+            questions = cache_data["short_answers"]
+        else:
+            print(">>> 正在处理简答题...")
+            questions = self.solve_short_answers(
+                parts["short_answer"],
+                screenshots.get("short_answer", {}),
+                reference_materials_text,
+            )
+            cache_data["short_answers"] = questions
+            cache_data["short_answers_cached_at"] = time.time()
+            self._save_cache(pdf_path, cache_data)
+
+        # 处理程序设计题（检查缓存）
+        if "programming_info" in cache_data and cache_data.get("programming_info"):
+            print(">>> [缓存] 使用缓存的程序设计题答案")
+            gitee_info = cache_data["programming_info"]
+        else:
+            print(">>> 正在处理程序设计题...")
+            gitee_info = self.handle_programming(parts["programming"])
+            cache_data["programming_info"] = gitee_info
+            cache_data["programming_cached_at"] = time.time()
+            self._save_cache(pdf_path, cache_data)
 
         context: Dict[str, Any] = {
             "homework_name": homework_name,
@@ -1194,6 +1424,11 @@ class HomeworkAutomator:
             "questions": questions,
             "gitee_info": gitee_info,
         }
+
+        # 保存最终完整缓存
+        cache_data["final_context"] = context
+        cache_data["completed_at"] = time.time()
+        self._save_cache(pdf_path, cache_data)
 
         output_file = self.generate_docx(homework_name, context)
         print(f"\n[成功] 作业已生成: {output_file}")
@@ -1216,6 +1451,51 @@ class HomeworkAutomator:
 2. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
 3. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出解释文字。
 4. 选择题 ans 的每一项只能是大写字母选项组合（如 A、AB、ACD），不得包含中文、标点和前缀文本。
+5. 简答题文字必须更易懂：先给结论，再给理由；句子简洁；允许轻微口语化表达，但不能牺牲专业准确性。
+6. 简答题必须使用正常中文标点并清晰断句，禁止无标点堆砌长段文字。
+"""
+                adj_res = self._call_ai(
+                    self.complex_client,
+                    self.complex_model,
+                    [{"role": "user", "content": adjustment_prompt}],
+                    response_format={"type": "json_object"},
+                )
+                if not adj_res or not hasattr(adj_res, "choices"):
+                    continue
+                adj_content = adj_res.choices[0].message.content
+                if adj_content:
+                    try:
+                        adjusted_context = self._parse_json_safe(adj_content)
+                        context = self._guard_context_update(context, adjusted_context)
+                    except Exception as e:
+                        print(f">>> [警告] 反馈修复 JSON 解析失败，保留原内容: {e}")
+                        continue
+                    output_file = self.generate_docx(homework_name, context)
+                    print(f"\n[成功] 已根据反馈重新生成作业: {output_file}")
+
+        output_file = self.generate_docx(homework_name, context)
+        print(f"\n[成功] 作业已生成: {output_file}")
+
+        while True:
+            feedback = input(
+                "\n请输入反馈 (输入 'OK' 确认并退出, 或输入修改意见): "
+            ).strip()
+            if feedback.upper() == "OK":
+                print("作业已确认，程序退出。")
+                break
+            else:
+                print(f">>> 正在根据反馈修改作业: {feedback}")
+                adjustment_prompt = f"""用户对生成的作业提出了修改意见："{feedback}"
+请根据意见调整当前的作业内容。
+当前内容：{json.dumps(context, ensure_ascii=False)}
+
+要求：
+1. 严格输出调整后的完整 JSON。
+2. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
+3. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出解释文字。
+4. 选择题 ans 的每一项只能是大写字母选项组合（如 A、AB、ACD），不得包含中文、标点和前缀文本。
+5. 简答题文字必须更易懂：先给结论，再给理由；句子简洁；允许轻微口语化表达，但不能牺牲专业准确性。
+6. 简答题必须使用正常中文标点并清晰断句，禁止无标点堆砌长段文字。
 """
                 adj_res = self._call_ai(
                     self.complex_client,
