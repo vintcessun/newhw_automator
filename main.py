@@ -1476,46 +1476,6 @@ class HomeworkAutomator:
         output_file = self.generate_docx(homework_name, context)
         print(f"\n[成功] 作业已生成: {output_file}")
 
-        while True:
-            feedback = input(
-                "\n请输入反馈 (输入 'OK' 确认并退出, 或输入修改意见): "
-            ).strip()
-            if feedback.upper() == "OK":
-                print("作业已确认，程序退出。")
-                break
-            else:
-                print(f">>> 正在根据反馈修改作业: {feedback}")
-                adjustment_prompt = f"""用户对生成的作业提出了修改意见："{feedback}"
-请根据意见调整当前的作业内容。
-当前内容：{json.dumps(context, ensure_ascii=False)}
-
-要求：
-1. 严格输出调整后的完整 JSON。
-2. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
-3. 禁止输出 Markdown、禁止输出代码块标记（如 ```json）、禁止输出解释文字。
-4. 选择题 ans 的每一项只能是大写字母选项组合（如 A、AB、ACD），不得包含中文、标点和前缀文本。
-5. 简答题文字必须更易懂：先给结论，再给理由；句子简洁；允许轻微口语化表达，但不能牺牲专业准确性。
-6. 简答题必须使用正常中文标点并清晰断句，禁止无标点堆砌长段文字。
-"""
-                adj_res = self._call_ai(
-                    self.complex_client,
-                    self.complex_model,
-                    [{"role": "user", "content": adjustment_prompt}],
-                    response_format={"type": "json_object"},
-                )
-                if not adj_res or not hasattr(adj_res, "choices"):
-                    continue
-                adj_content = adj_res.choices[0].message.content
-                if adj_content:
-                    try:
-                        adjusted_context = self._parse_json_safe(adj_content)
-                        context = self._guard_context_update(context, adjusted_context)
-                    except Exception as e:
-                        print(f">>> [警告] 反馈修复 JSON 解析失败，保留原内容: {e}")
-                        continue
-                    output_file = self.generate_docx(homework_name, context)
-                    print(f"\n[成功] 已根据反馈重新生成作业: {output_file}")
-
 
 if __name__ == "__main__":
     import argparse
