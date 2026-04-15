@@ -15,3 +15,4 @@ problems/
 *.docx
 !template.docx
 references/
+.homework_cache/
