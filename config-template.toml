@@ -1,3 +1,6 @@
+[llm]
+timeout_seconds = 3600
+
 [llm.simple]
 model = "YOUR_SIMPLE_MODEL_NAME"
 api_key = "YOUR_API_KEY"
@@ -10,6 +13,37 @@ base_url = "https://api.example.com/v1"
 
 [searxng]
 base_url = "http://searxng-example.com/"
+timeout_seconds = 3600
+
+[retrieval]
+references_dir = "references"
+web_dir = "web"
+qdrant_path = ".qdrant"
+collection_name = "newhw_reference_knowledge"
+# embedding 后端（llama.cpp）配置
+embedding_base_url = "http://127.0.0.1:8080"
+embedding_api_key = "sk-no-key"
+embedding_model = "your-embedding-model-name"
+flash_model = "YOUR_FLASH_MODEL_NAME"
+embedding_timeout = 120
+embedding_workers = 8
+image_to_text_workers = 8
+embedding_text_instruct = "Represent this document for retrieval: "
+embedding_image_input_token = "<|vision_start|><|image_pad|><|vision_end|>"
+chunk_size = 900
+chunk_overlap = 120
+min_chunk_chars = 80
+merge_target_chars = 1800
+max_chunk_chars = 3200
+repair_low_quality_with_llm = true
+low_quality_repair_min_chars = 40
+low_quality_repair_max_chars = 3200
+local_top_k = 6
+web_top_k = 8
+max_keyword_rounds = 4
+web_filter_min_relevance = 0.55
+reset_dialog_every_rounds = 10
+enable_periodic_dialog_reset = true
 
 [student_info]
 name = "张三"

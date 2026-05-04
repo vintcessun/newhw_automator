@@ -7,7 +7,8 @@
 - **智能 PDF 结构化解析**：利用 AI 将乱序的 PDF 文本自动分类为选择题、简答题和编程题。
 - **选择题容量扩展**：第一部分选择题按模板支持最多 30 题（超出部分不会写入模板）。
 - **题目截图自动生成**：脚本会把 PDF 中每道题自动截图并保存到 `problems/` 目录。**支持跨页题目自动识别与垂直合并**，并利用 `numpy` 智能跳过页眉页脚，确保题目截图的完整性。后续答题与审阅阶段会附上对应题图，显著提升复杂题目的理解准确度。
-- **参考资料前置注入**：可通过命令行参数传入多个参考 PDF/Markdown 文件，系统会在每次题目“生成 + 审阅”时都附带这些参考资料，避免只在最后阶段一次性修复。
+- **统一参考知识库**：自动扫描 `references/` 目录，使用 **Unstructured** 拆分文件并写入本地向量库（Qdrant 持久化）。PDF 会按页截图并作为页级证据入库。
+- **双通道检索**：搜索工具 `search` 会同时走本地知识库与联网检索；网络命中会先经小模型过滤后写入 `references/web/`，随后自动增量入库。
 - **Chain-of-Thought (CoT) 推理**：模型在给出答案前，必须在 `<thought>` 标签内明确列出【考察知识点】并展示逻辑推导过程。
 - **循环审阅与事实核查机制**：
   - **每题搜索**：在解答每一道选择题和简答题前，AI 会先调用 **SearxNG** 进行背景搜索。
@@ -58,37 +59,31 @@ uv sync
 uv run python main.py [作业文件名.pdf]
 ```
 
-可选：传入多个参考资料文件（每次题目生成与审阅都会附带）
+- 可选：指定参考资料目录（默认 `references/`）
 
 ```bash
-uv run python main.py [作业文件名.pdf] \
-  --reference-pdf [参考1.pdf] \
-  --reference-pdf [参考2.pdf] \
-  --reference-md [参考1.md] \
-  --reference-md [参考2.md]
+uv run python main.py [作业文件名.pdf] --references-dir references
 ```
 
 示例：
 
 ```bash
-uv run python main.py 第6课作业.pdf --reference-pdf 第6课参考答案.pdf --reference-md notes.md
+uv run python main.py 第6课作业.pdf --references-dir references
 ```
+
+兼容说明：
+- `--reference-pdf` / `--reference-md` 目前仍可传入，但已弃用，仅用于兼容旧命令，不再参与新检索链路。
 
 启动后程序会先打印参数解析结果，便于确认是否识别正确，包括：
 - `target_pdf`
-- `reference_pdfs`（数量与逐项路径）
-- `reference_mds`（数量与逐项路径）
+- `references_dir`（若使用覆盖参数）
 
 示例输出：
 
 ```text
 >>> 命令行参数解析结果:
 >>> target_pdf: 第6课作业.pdf
->>> reference_pdfs (2):
-  1. 第6课参考答案.pdf
-  2. 第6课补充资料.pdf
->>> reference_mds (1):
-  1. notes.md
+>>> references_dir override: references
 ```
 
 ### 3. 交互流程

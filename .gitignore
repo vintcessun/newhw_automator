@@ -14,5 +14,9 @@ config.toml
 problems/
 *.docx
 !template.docx
-references/
 .homework_cache/
+.image_desc_cache/
+.qdrant/
+references/
+.image_desc_cache/
+.vscode/
