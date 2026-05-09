@@ -372,7 +372,7 @@ class ReferenceIndexManager:
     ):
         self.references_dir = Path(retrieval_cfg.get("references_dir", "references"))
         self.web_dir_name = str(retrieval_cfg.get("web_dir", "web"))
-        self.web_dir = self.references_dir / self.web_dir_name
+        self.web_dir = Path(self.web_dir_name)
         self.qdrant_path = str(retrieval_cfg.get("qdrant_path", ".qdrant"))
         self.collection_name = str(
             retrieval_cfg.get("collection_name", "newhw_reference_knowledge")
