@@ -98,6 +98,96 @@ class PDFProcessor:
 
         return question_ids
 
+    def _base_question_number(self, qid: Any) -> int:
+        m = re.match(r"^\s*(\d{1,3})", str(qid))
+        return int(m.group(1)) if m else -1
+
+    def extract_parts_by_fixed_sections(self, pdf_path: str) -> Dict[str, Any]:
+        """按固定分区标题解析题目，并按连续递增题号过滤正文编号。"""
+        section_patterns = [
+            ("choice", re.compile(r"^\s*(?:一|1)[、.．]\s*单项选择题\s*$")),
+            ("short_answer", re.compile(r"^\s*(?:二|2)[、.．]\s*简答题\s*$")),
+            ("programming", re.compile(r"^\s*(?:三|3)[、.．]\s*程序设计题\s*$")),
+        ]
+        q_start_re = re.compile(r"^\s*(\d{1,3}(?:_sub_\d+)?)\s*[\.、．\)]\s*(.*)")
+
+        rows: List[Dict[str, Any]] = []
+        doc = fitz.open(pdf_path)
+        try:
+            for page_idx in range(len(doc)):
+                for line in self.extract_page_lines(doc[page_idx]):
+                    text = str(line.get("text", "")).strip()
+                    if not text:
+                        continue
+                    rows.append(
+                        {
+                            "page": page_idx,
+                            "y": float(line.get("bbox", [0, 0, 0, 0])[1]),
+                            "text": text,
+                        }
+                    )
+        finally:
+            doc.close()
+
+        rows.sort(key=lambda item: (item["page"], item["y"]))
+
+        events: List[Dict[str, Any]] = []
+        current_section = ""
+        expected_question_number = None
+        for idx, row in enumerate(rows):
+            text = row["text"].strip()
+            for section_name, pattern in section_patterns:
+                if pattern.match(text):
+                    current_section = section_name
+                    events.append({"kind": "section", "section": section_name, "idx": idx})
+                    break
+            else:
+                m = q_start_re.match(text)
+                if m and current_section:
+                    q_number = self._base_question_number(m.group(1))
+                    if q_number < 0:
+                        continue
+                    if (
+                        expected_question_number is not None
+                        and q_number != expected_question_number
+                    ):
+                        continue
+                    events.append(
+                        {
+                            "kind": "question",
+                            "section": current_section,
+                            "idx": idx,
+                            "id": m.group(1),
+                        }
+                    )
+                    expected_question_number = q_number + 1
+
+        question_events = [e for e in events if e["kind"] == "question"]
+        section_events = [e for e in events if e["kind"] == "section"]
+        parts: Dict[str, Any] = {"choice": [], "short_answer": [], "programming": []}
+
+        for pos, event in enumerate(question_events):
+            section = str(event["section"])
+            start_idx = int(event["idx"])
+            next_question_idx = (
+                int(question_events[pos + 1]["idx"])
+                if pos + 1 < len(question_events)
+                else len(rows)
+            )
+            next_section_idx = next(
+                (
+                    int(se["idx"])
+                    for se in section_events
+                    if int(se["idx"]) > start_idx
+                ),
+                len(rows),
+            )
+            end_idx = min(next_question_idx, next_section_idx)
+            question_text = "\n".join(row["text"] for row in rows[start_idx:end_idx])
+            parts[section].append({"id": str(event["id"]), "question": question_text})
+
+        return parts
+
     def extract_homework_name_from_pdf(self, pdf_path: str, call_ai_func) -> str:
         """用 AI 从 PDF 首页提取作业名称"""
         try:

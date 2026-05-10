@@ -62,6 +62,8 @@ class HomeworkAutomator:
         )
         self._active_question_context: Optional[Dict[str, Any]] = None
         self._active_question_image_inputs: List[Tuple[str, str]] = []
+        self._active_question_lookup: Dict[str, Dict[str, Any]] = {}
+        self._active_question_image_map: Dict[str, str] = {}
         self.web_top_k = int(self.retrieval_cfg.get("web_top_k", 8))
         self.local_top_k = int(self.retrieval_cfg.get("local_top_k", 6))
         self.max_keyword_rounds = int(self.retrieval_cfg.get("max_keyword_rounds", 4))
@@ -83,6 +85,35 @@ class HomeworkAutomator:
                             }
                         },
                         "required": ["code"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_question_asset",
+                    "description": (
+                        "获取当前作业中任意题目的题干文字和已有题目截图。"
+                        "当题目提到“上题图”“下图”“第N题图”“上题网络拓扑”等需要参考其他题目图片或题干时，必须调用此工具。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question_id": {
+                                "type": "string",
+                                "description": "要获取的题号，如 27。若使用 relation=previous/next 可省略。",
+                            },
+                            "relation": {
+                                "type": "string",
+                                "enum": ["current", "previous", "next"],
+                                "description": "相对当前题获取 current/previous/next。遇到“上题图”用 previous。",
+                            },
+                            "current_question_id": {
+                                "type": "string",
+                                "description": "可选，当前题号；默认使用正在作答的题号。",
+                            },
+                        },
+                        "required": [],
                     },
                 },
             },
@@ -797,6 +828,93 @@ class HomeworkAutomator:
         )
         return text
 
+    def _activate_question_assets(
+        self, parts: Dict[str, Any], screenshots: Dict[str, Dict[str, str]]
+    ) -> None:
+        """缓存当前作业的题干和截图映射，供工具调用按题号取用。"""
+        lookup: Dict[str, Dict[str, Any]] = {}
+        for section in ("choice", "short_answer", "programming"):
+            for q in parts.get(section, []):
+                if not isinstance(q, dict):
+                    continue
+                qid = str(q.get("id", "")).strip()
+                if qid:
+                    item = dict(q)
+                    item["section"] = section
+                    lookup[qid] = item
+
+        image_map: Dict[str, str] = {}
+        for section_map in screenshots.values():
+            if not isinstance(section_map, dict):
+                continue
+            for qid, path in section_map.items():
+                if str(qid).strip() and str(path).strip():
+                    image_map[str(qid).strip()] = str(path).strip()
+
+        self._active_question_lookup = lookup
+        self._active_question_image_map = image_map
+
+    def _resolve_question_asset_id(self, args: Dict[str, Any]) -> str:
+        current_qid = str(args.get("current_question_id") or "").strip()
+        if not current_qid and isinstance(self._active_question_context, dict):
+            current_qid = str(self._active_question_context.get("id", "")).strip()
+
+        relation = str(args.get("relation") or "").strip().lower()
+        requested_qid = str(args.get("question_id") or "").strip()
+        if requested_qid:
+            return requested_qid
+        if relation in {"current", ""}:
+            return current_qid
+
+        try:
+            current_num = int(current_qid.split("-")[0])
+        except Exception:
+            return ""
+        if relation == "previous":
+            return str(current_num - 1)
+        if relation == "next":
+            return str(current_num + 1)
+        return ""
+
+    def _get_question_asset(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, List[Tuple[str, str]]]:
+        qid = self._resolve_question_asset_id(args)
+        payload: Dict[str, Any] = {
+            "requested": args,
+            "resolved_question_id": qid,
+            "found": False,
+            "question": "",
+            "section": "",
+            "image_path": "",
+            "has_image": False,
+        }
+        if not qid:
+            payload["error"] = "无法确定题号，请提供 question_id 或 relation。"
+            return json.dumps(payload, ensure_ascii=False), []
+
+        question = self._active_question_lookup.get(qid)
+        image_path = self._active_question_image_map.get(qid, "")
+        if isinstance(question, dict):
+            payload.update(
+                {
+                    "found": True,
+                    "question": question.get("question", ""),
+                    "section": question.get("section", ""),
+                }
+            )
+        else:
+            payload["error"] = f"当前作业中未找到第 {qid} 题。"
+
+        if image_path and os.path.exists(image_path):
+            payload["image_path"] = image_path
+            payload["has_image"] = True
+            image_inputs = [(f"第 {qid} 题题目截图", image_path)]
+        else:
+            image_inputs = []
+
+        return json.dumps(payload, ensure_ascii=False), image_inputs
+
     def _handle_tool_calls(
         self, tool_calls: Any
     ) -> Tuple[List[Dict[str, str]], List[Tuple[str, str]]]:
@@ -813,6 +931,9 @@ class HomeworkAutomator:
 
             if func_name == "python_interpreter":
                 result = self._execute_python(args.get("code", ""))
+            elif func_name == "get_question_asset":
+                result, question_asset_images = self._get_question_asset(args)
+                image_inputs.extend(question_asset_images)
             elif func_name in {"search", "search_web"}:
                 question_context = (
                     args.get("question_context")
@@ -1104,7 +1225,7 @@ class HomeworkAutomator:
                 current_messages.extend(tool_results)
                 if tool_image_inputs:
                     image_message = self._build_image_message(
-                        "以下是本轮工具检索命中的图片证据，请结合上一条工具结果中的来源使用；图片证据以附件本身为准。",
+                        "以下是本轮工具返回的图片证据，请结合上一条工具结果中的来源使用；图片证据以附件本身为准。",
                         tool_image_inputs,
                     )[0]
                     current_messages.append(image_message)
@@ -1397,6 +1518,10 @@ class HomeworkAutomator:
         ]
         q_start_re = re.compile(r"^\s*(\d{1,3}(?:_sub_\d+)?)\s*[\.、．\)]\s*(.*)")
 
+        def _base_question_number(qid: Any) -> Optional[int]:
+            m = re.match(r"^\s*(\d{1,3})", str(qid))
+            return int(m.group(1)) if m else None
+
         rows: List[Dict[str, Any]] = []
         doc = fitz.open(pdf_path)
         try:
@@ -1419,6 +1544,7 @@ class HomeworkAutomator:
 
         events: List[Dict[str, Any]] = []
         current_section = ""
+        expected_question_number: Optional[int] = None
         for idx, row in enumerate(rows):
             text = row["text"].strip()
             for section_name, pattern in section_patterns:
@@ -1429,6 +1555,14 @@ class HomeworkAutomator:
             else:
                 m = q_start_re.match(text)
                 if m and current_section:
+                    q_number = _base_question_number(m.group(1))
+                    if q_number is None:
+                        continue
+                    if (
+                        expected_question_number is not None
+                        and q_number != expected_question_number
+                    ):
+                        continue
                     events.append(
                         {
                             "kind": "question",
@@ -1437,6 +1571,7 @@ class HomeworkAutomator:
                             "id": m.group(1),
                         }
                     )
+                    expected_question_number = q_number + 1
 
         question_events = [e for e in events if e["kind"] == "question"]
         section_events = [e for e in events if e["kind"] == "section"]
@@ -1465,7 +1600,7 @@ class HomeworkAutomator:
         return parts
 
     def _parts_look_misclassified(self, parts: Any) -> bool:
-        """识别旧缓存中的坏分类：所有题都被塞进 choice，简答/程序为空。"""
+        """识别旧缓存中的坏分类或坏切分。"""
         if not isinstance(parts, dict):
             return True
         choices = parts.get("choice")
@@ -1473,7 +1608,21 @@ class HomeworkAutomator:
         programs = parts.get("programming")
         if not isinstance(choices, list) or not isinstance(shorts, list) or not isinstance(programs, list):
             return True
-        return len(choices) > 0 and len(shorts) == 0 and len(programs) == 0
+        if len(choices) > 0 and len(shorts) == 0 and len(programs) == 0:
+            return True
+
+        expected: Optional[int] = None
+        for q in choices + shorts + programs:
+            if not isinstance(q, dict):
+                return True
+            m = re.match(r"^\s*(\d{1,3})", str(q.get("id", "")))
+            if not m:
+                return True
+            q_number = int(m.group(1))
+            if expected is not None and q_number != expected:
+                return True
+            expected = q_number + 1
+        return False
 
     def _extract_homework_name_from_pdf(self, pdf_path: str) -> str:
         """用 AI 从 PDF 首页提取作业名称"""
@@ -1647,8 +1796,9 @@ class HomeworkAutomator:
 要求使用 Chain-of-Thought (CoT) 模式：
 1. 深入分析题目背景，并在 <thought> 标签内明确列出【考察知识点】。
 2. 优先参考提供的【参考资料】与【参考背景信息】辅助推导。
-3. 展现分步骤推导逻辑。
-4. 最终答案必须写在 <answer> 标签内，且只能包含大写字母选项（如 A、AB、ACD），不得包含中文、标点、括号、前缀文本（如“答案：”）。
+3. 如果题目提到“上题图”“下图”“第N题图”等跨题图片引用，先调用 get_question_asset 获取对应题目的题干和截图，再作答。
+4. 展现分步骤推导逻辑。
+5. 最终答案必须写在 <answer> 标签内，且只能包含大写字母选项（如 A、AB、ACD），不得包含中文、标点、括号、前缀文本（如“答案：”）。
 
 输出格式硬约束（必须全部满足）：
 1. 只能输出一个 JSON 对象，首字符必须是 {{，末字符必须是 }}。
@@ -1875,7 +2025,8 @@ class HomeworkAutomator:
 要求使用 CoT 模式进行推理：
 1. 在 <thought> 标签内首先明确列出该题目的【考察知识点】，结合【参考资料】、【参考背景信息】和之前的【反馈意见】（如果有）进行逻辑推导。
 2. 将最终给出的回答写在 <answer> 标签内。
-3. 回答要求（像学生交给老师的作业答案）：
+3. 如果题目提到“上题图”“下图”“第N题图”等跨题图片引用，先调用 get_question_asset 获取对应题目的题干和截图，再作答。
+4. 回答要求（像学生交给老师的作业答案）：
     - 语气自然、认真、书面化，像大学生写给任课老师看的课程作业，不要写成公文、论文摘要或审稿意见。
      - 格式规则：
          * 正文一律使用完整的中文段落，不能用 Markdown 加粗（**）、斜体（*）、无序列表（-）、有序列表、代码块等。
@@ -2684,6 +2835,7 @@ class HomeworkAutomator:
         print(f">>> 作业名称: {homework_name}")
         if cache_data.get("screenshots_dir"):
             print(f">>> 题目截图目录: {cache_data.get('screenshots_dir')}")
+        self._activate_question_assets(parts, screenshots)
 
         reference_image_inputs: List[Tuple[str, str]] = []
         reference_materials_text = (
